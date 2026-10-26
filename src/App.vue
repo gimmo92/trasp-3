@@ -1,0 +1,7251 @@
+﻿<script setup>
+import { ref, computed, onMounted, nextTick } from 'vue'
+import {
+  parseExcelFromUrl,
+  parseExcelFromFile,
+  detectColumnRoles,
+  buildNormalizedData,
+  COLUMN_ROLES,
+  getRoleLabel,
+  MAPPING_UI_SECTIONS,
+  isMappingRoleAssigned,
+  missingRequiredMappingRoles,
+  missingRecommendedMappingRoles,
+} from './lib/excel.js'
+import { mergeColumnMappings, isTeaTracciato } from './lib/column-mapping.js'
+import { teaPayComposition } from './lib/teaTracciato.js'
+import { computeIndicators, computeBandGenderGaps, computeAdjustedGap } from './lib/indicators.js'
+import {
+  suggestColumnMappingWithGemini,
+  computeIndicatorsWithGemini,
+} from './lib/gemini.js'
+import {
+  buildNormalizedJobGradingData,
+  groupByLevel,
+  enrichWithDeviation,
+  seniorityToYearsNumeric,
+  normalizeLevelLabel,
+  jobGradingFasce,
+  fasciaLevelsLabel,
+} from './lib/jobGrading.js'
+import {
+  TRANSPARENCY_MACRO_AREAS,
+  TRANSPARENCY_FLAT_FACTORS,
+  trFieldName,
+  transparencyParametricPointsFromFactor,
+} from './lib/transparencyCriteria.js'
+import {
+  computeEuGenderDashboard,
+  computeQuartileOutliers,
+  assignSalaryQuartiles,
+  gapSeverityClass as euGapSeverityClass,
+  EU_GAP_THRESHOLD_PCT,
+} from './lib/euGenderDashboard.js'
+import {
+  SALARY_METRICS,
+  getComparisonValue,
+  getMetricLabel,
+  MIN_GENDER_SAMPLE,
+} from './lib/salaryMetrics.js'
+import {
+  analyzeGenderPayGap,
+  computeCcnlGroupedComparison,
+  flattenCcnlLevelRows,
+  computeCostCenterComparison,
+  computeGapHotspots,
+  gapStatusCssClass,
+} from './lib/gapGroupAnalysis.js'
+import {
+  saveAnalysis,
+  fetchAnalyses,
+  fetchAnalysisById,
+  deleteAnalysisById,
+  updateAnalysisSnapshot,
+} from './lib/persistence.js'
+import {
+  SNAPSHOT_VERSION,
+  buildAnalysisSnapshot,
+  buildHistoryView,
+  needsSnapshotUpgrade,
+  peopleFromSource,
+  snapshotFromStoredRecord,
+  sourceLabel,
+} from './lib/analysisSnapshot.js'
+import { simulateHire } from './lib/hireSimulation.js'
+import {
+  GAP_REPORT_VERSION,
+  buildGroupsAboveThreshold,
+  buildExposureHotspots,
+  summarizeGroupCounts,
+  attachJustificationsToRows,
+} from './lib/gapReportPayload.js'
+import {
+  buildPayCommunicationPayload,
+  DEFAULT_PAY_CRITERIA_TEXT,
+} from './lib/payCommunicationPayload.js'
+import SalaryReview from './components/SalaryReview.vue'
+import { peopleFromJobResults } from './lib/salaryReview.js'
+
+const activeSection = ref('analisi')
+
+/** Tab principali */
+const sections = [
+  { id: 'analisi', label: 'Analisi', icon: 'table' },
+  { id: 'storico', label: 'Storico', icon: 'history' },
+  { id: 'insights', label: 'Analisi storico', icon: 'chart' },
+]
+
+/** Menu laterale (shell sezioni) */
+const activeSideItem = ref('compensation-transparency')
+const sideExpanded = ref({ compensation: true })
+const sideMenu = [
+  { id: 'profilo', label: 'Profilo', icon: 'info' },
+  { id: 'dashboard', label: 'Dashboard', icon: 'chart' },
+  { id: 'azienda', label: 'La mia azienda', icon: 'user', expandable: true },
+  { id: 'mbo', label: 'MBO', icon: 'target', expandable: true },
+  { id: 'competenze', label: 'Competenze', icon: 'book-open', expandable: true },
+  { id: 'valutazioni', label: 'Valutazioni', icon: 'eval', expandable: true },
+  { id: 'okr', label: 'OKR', icon: 'okr', expandable: true },
+  { id: 'clima', label: 'Analisi di Clima', icon: 'clipboard', expandable: true },
+  { id: 'formazione', label: 'Formazione', icon: 'book', expandable: true },
+  {
+    id: 'compensation',
+    label: 'Compensation',
+    icon: 'info',
+    expandable: true,
+    children: [
+      { id: 'compensation-transparency', label: 'Transparency' },
+      { id: 'compensation-salary-review', label: 'Salary review' },
+    ],
+  },
+]
+const activeSideLabel = computed(() => {
+  for (const item of sideMenu) {
+    if (item.id === activeSideItem.value) return item.label
+    const child = item.children?.find((entry) => entry.id === activeSideItem.value)
+    if (child) return child.label
+  }
+  return ''
+})
+
+function sideItemIsActive(item) {
+  if (item.children?.some((child) => child.id === activeSideItem.value)) return true
+  return activeSideItem.value === item.id
+}
+
+function onSideItemClick(item) {
+  if (item.children?.length) {
+    const inside = item.children.some((child) => child.id === activeSideItem.value)
+    if (inside) {
+      sideExpanded.value = { ...sideExpanded.value, [item.id]: !sideExpanded.value[item.id] }
+      return
+    }
+    sideExpanded.value = { ...sideExpanded.value, [item.id]: true }
+    activeSideItem.value = item.children[0].id
+    return
+  }
+  activeSideItem.value = item.id
+}
+
+// Flusso unificato
+const analisiStep = ref('upload') // idle | upload | mapping | results — default upload con sezione Analisi
+const excelRows = ref([])
+const excelHeaders = ref([])
+const columnMapping = ref({})
+const excelUrl = ref('')
+const excelFile = ref(null)
+const excelFileInputRef = ref(null)
+const uploadError = ref('')
+/** Avviso informativo (non errore) su mapping euristico / AI (Claude) */
+const geminiInfoNotice = ref('')
+const uploadLoading = ref(false)
+const geminiLoading = ref(false)
+const analysisLoading = ref(false)
+const saveStatus = ref('')
+const saveStatusIsError = ref(false)
+const historySaving = ref(false)
+/** Nome assegnato al salvataggio nello storico. */
+const analysisSaveName = ref('')
+
+const indicatorsResult = ref(null)
+const indicatorsSource = ref('locale')
+
+const jobResults = ref([])
+const jobFasce = computed(() => jobGradingFasce(jobResults.value))
+const reviewSourcePeople = computed(() => peopleFromJobResults(jobResults.value))
+
+/** Override punteggi 0–100 per ruolo: chiave `${livelloCCNL}|${nomeRuolo}` → { factorId: number } */
+const transparencyRoleOverrides = ref({})
+const jobGradingCriteriaModalOpen = ref(false)
+/** Popup scheda punteggi fattori per ruolo: { level, subLabel, roleName } */
+const roleValuationModal = ref(null)
+
+const roleValuationModalRb = computed(() => {
+  const ctx = roleValuationModal.value
+  if (!ctx) return null
+  const sub = jobFasce.value.find((h) => h.label === ctx.subLabel)
+  return sub?.roles?.find((r) => r.role === ctx.roleName && r.level === ctx.level) ?? null
+})
+
+function openRoleValuationModal(level, subLabel, roleName) {
+  const sub = jobFasce.value.find((h) => h.label === subLabel)
+  const role = sub?.roles?.find((r) => r.role === roleName && r.level === level)
+  if (!role) return
+  const next = emptyRoleTransparencyForm()
+  for (const f of TRANSPARENCY_FLAT_FACTORS) {
+    next[f.id] = clampTrScore(role[trFieldName(f.id)])
+  }
+  roleValuationForm.value = next
+  roleValuationModal.value = { level, subLabel, roleName }
+}
+function closeRoleValuationModal() {
+  roleValuationModal.value = null
+}
+function saveRoleValuationModal() {
+  const ctx = roleValuationModal.value
+  if (!ctx) return
+  const overrides = {}
+  for (const f of TRANSPARENCY_FLAT_FACTORS) {
+    overrides[f.id] = clampTrScore(roleValuationForm.value[f.id])
+  }
+  const key = `${ctx.level}|${ctx.roleName}`
+  transparencyRoleOverrides.value = { ...transparencyRoleOverrides.value, [key]: overrides }
+  roleValuationModal.value = null
+  runJobGrading()
+}
+
+/** Risultati analisi: dashboard UE genere (default) | job grading | giustificativo persona */
+const resultsTab = ref('eu_dashboard')
+/** Tab risultati da ripristinare dopo chiusura giustificativo persona */
+const resultsTabBeforeJustify = ref('job_grading')
+/** Metrica retributiva per KPI dashboard (default: retribuzione base) */
+const euDashboardMetric = ref(SALARY_METRICS.base)
+
+const euDashboardMetricOptions = [
+  { value: SALARY_METRICS.base, label: 'RAL annua' },
+  { value: SALARY_METRICS.totale, label: 'Retribuzione totale' },
+  { value: SALARY_METRICS.variabile, label: 'Componenti variabili' },
+]
+
+const reportCompanyName = ref('')
+const reportReferencePeriod = ref('')
+const reportIncludeFascia = ref(true)
+const reportIncludeCostCenter = ref(true)
+const gapReportExportLoading = ref(false)
+
+const payCommLoadingIndex = ref(null)
+
+const euMetricLabel = computed(() => getMetricLabel(euDashboardMetric.value))
+const euMetricLabelShort = computed(() => getMetricLabel(euDashboardMetric.value, { short: true }))
+
+/** Giustificativi outlier quartile: chiave = index dipendente; testo non vuoto = escluso dall'analisi */
+const quartileOutlierJustifications = ref({})
+
+function isQuartileAnalysisExcluded(index) {
+  const t = quartileOutlierJustifications.value[String(index)]
+  return typeof t === 'string' && t.trim().length > 0
+}
+
+const geminiEnabled = ref(false)
+/** true se /api/gemini/status non risponde (es. solo Vite senza server API) */
+const geminiApiUnreachable = ref(false)
+
+/** Area scroll principale (per scroll in alto aprendo giustificativo) */
+const mainWrapRef = ref(null)
+
+const mappingUiSections = MAPPING_UI_SECTIONS
+const teaTracciatoActive = computed(() => isTeaTracciato(excelHeaders.value))
+
+const mappingRequiredMissing = computed(() =>
+  missingRequiredMappingRoles(columnMapping.value).map(getRoleLabel),
+)
+const mappingRecommendedMissing = computed(() =>
+  missingRecommendedMappingRoles(columnMapping.value).map(getRoleLabel),
+)
+const canConfirmMapping = computed(() => mappingRequiredMissing.value.length === 0)
+
+function isMappingFieldAssigned(role) {
+  return isMappingRoleAssigned(columnMapping.value, role)
+}
+
+const showAnalisiFlow = computed(() => activeSection.value === 'analisi')
+const showStorico = computed(() => activeSection.value === 'storico')
+const showInsights = computed(() => activeSection.value === 'insights')
+
+// Storico
+const storicoList = ref([])
+const storicoLoading = ref(false)
+const storicoError = ref('')
+const storicoDeleting = ref(null)
+
+async function loadStorico() {
+  storicoLoading.value = true
+  storicoError.value = ''
+  try {
+    const list = await fetchAnalyses()
+    for (const item of list) {
+      if (!needsSnapshotUpgrade(item)) continue
+      try {
+        const full = await fetchAnalysisById(item.id)
+        const snap = snapshotFromStoredRecord(full)
+        if (snap?.version === SNAPSHOT_VERSION) {
+          await updateAnalysisSnapshot(item.id, snap)
+          item.snapshot_json = snap
+          if (!item.row_count && Array.isArray(full.rows_json)) item.row_count = full.rows_json.length
+        }
+      } catch {
+        // un record illeggibile non blocca gli altri
+      }
+    }
+    storicoList.value = list
+  } catch (err) {
+    storicoError.value = err.message || 'Impossibile caricare lo storico.'
+  } finally {
+    storicoLoading.value = false
+  }
+}
+
+async function removeAnalysis(id) {
+  if (!confirm('Eliminare questa analisi?')) return
+  storicoDeleting.value = id
+  try {
+    await deleteAnalysisById(id)
+    storicoList.value = storicoList.value.filter((a) => a.id !== id)
+  } catch (err) {
+    storicoError.value = 'Eliminazione non riuscita: ' + (err.message || String(err))
+  } finally {
+    storicoDeleting.value = null
+  }
+}
+
+const storicoViewing = ref(null)
+
+async function viewAnalysis(id) {
+  storicoViewing.value = id
+  storicoError.value = ''
+  try {
+    const record = await fetchAnalysisById(id)
+    const results = record.results_json || {}
+    justifications.value = {}
+
+    excelUrl.value = record.source_url || ''
+    analysisSaveName.value = String(record.name || '').trim() || sourceLabel(record)
+    columnMapping.value = record.mapping_json || {}
+    excelHeaders.value = record.headers_json || []
+    excelRows.value = record.rows_json || []
+    transparencyRoleOverrides.value = record.overrides_json || {}
+    saveStatusIsError.value = false
+    const storedRows = Array.isArray(record.rows_json) ? record.rows_json.length : 0
+    saveStatus.value = `Analisi caricata dallo storico (${storedRows} righe).`
+
+    const canRebuild =
+      excelRows.value.length > 0 &&
+      excelHeaders.value.length > 0 &&
+      columnMapping.value &&
+      Object.keys(columnMapping.value).length > 0
+
+    if (canRebuild) {
+      runJobGrading()
+      const normalizedGender = buildNormalizedData(excelRows.value, excelHeaders.value, columnMapping.value)
+      genderNormalizedCache.value = normalizedGender
+      indicatorsResult.value = normalizedGender.length
+        ? computeIndicators(normalizedGender, { metric: euDashboardMetric.value })
+        : null
+      indicatorsSource.value = 'locale'
+    } else {
+      indicatorsResult.value = results.gender || null
+      indicatorsSource.value = (record.calculation_source || '').includes('gender:ai') ? 'ai' : 'locale'
+      jobResults.value = results.jobGrading || []
+      genderNormalizedCache.value = []
+    }
+    bandGenderJustifications.value = {}
+    quartileOutlierJustifications.value = {}
+
+    analisiStep.value = 'results'
+    resultsTab.value = 'eu_dashboard'
+    justifyingPerson.value = null
+    activeSection.value = 'analisi'
+  } catch (err) {
+    storicoError.value = 'Impossibile caricare l\'analisi: ' + (err.message || String(err))
+  } finally {
+    storicoViewing.value = null
+  }
+}
+
+function formatDate(iso) {
+  if (!iso) return '–'
+  const d = new Date(iso)
+  return d.toLocaleString('it-IT', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' })
+}
+
+function analysisTypeLabel(t) {
+  if (t === 'pay_transparency') return 'Trasparenza salariale'
+  if (t === 'job_grading') return 'Job Grading'
+  if (t === 'combined') return 'Analisi completa'
+  return t || '–'
+}
+
+const insightsPane = ref('andamento')
+const historyView = computed(() => buildHistoryView(storicoList.value))
+
+const simForm = ref({
+  name: '',
+  gender: 'F',
+  level: '',
+  role: '',
+  baseSalary: '',
+  variableComponents: '',
+  partTimePct: 100,
+})
+const simResult = ref(null)
+const simError = ref('')
+
+const simLevelOptions = computed(() => {
+  const set = new Set()
+  for (const band of jobResults.value || []) {
+    if (band?.level) set.add(String(band.level))
+  }
+  return [...set]
+})
+
+const simRoleOptions = computed(() => {
+  const set = new Set()
+  for (const hay of jobFasce.value) {
+    for (const role of hay.roles || []) {
+      if (role?.role) set.add(String(role.role))
+    }
+  }
+  return [...set].sort((a, b) => a.localeCompare(b, 'it'))
+})
+
+const canSimulate = computed(
+  () => excelRows.value.length > 0 && Object.keys(columnMapping.value || {}).length > 0,
+)
+
+function formatEuro(n) {
+  if (n == null || !Number.isFinite(Number(n))) return '–'
+  return `${Number(n).toLocaleString('it-IT', { maximumFractionDigits: 0 })} €`
+}
+
+function formatDeltaEuro(n) {
+  if (n == null || !Number.isFinite(Number(n))) return '–'
+  const v = Number(n)
+  const sign = v > 0 ? '+' : ''
+  return `${sign}${v.toLocaleString('it-IT', { maximumFractionDigits: 0 })} €`
+}
+
+function formatDeltaPct(n) {
+  if (n == null || !Number.isFinite(Number(n))) return '–'
+  const v = Number(n)
+  const sign = v > 0 ? '+' : ''
+  return `${sign}${v.toFixed(2)} pp`
+}
+
+function formatDeltaCount(n) {
+  if (n == null || !Number.isFinite(Number(n))) return '–'
+  const v = Number(n)
+  const sign = v > 0 ? '+' : ''
+  return `${sign}${v.toLocaleString('it-IT', { maximumFractionDigits: 0 })}`
+}
+
+function deltaOf(after, before) {
+  if (after == null || before == null) return null
+  if (!Number.isFinite(Number(after)) || !Number.isFinite(Number(before))) return null
+  return Number(after) - Number(before)
+}
+
+function historyGapBarHeight(gap) {
+  const points = historyView.value.points || []
+  const max = Math.max(5, ...points.map((p) => Math.abs(Number(p.snapshot?.gapMean) || 0)))
+  const pct = Math.abs(Number(gap) || 0) / max
+  return `${Math.max(4, Math.round(pct * 96))}px`
+}
+
+function runHireSimulation() {
+  simError.value = ''
+  simResult.value = null
+  if (!canSimulate.value) {
+    simError.value = 'Esegui o apri un\'analisi: la simulazione usa i dipendenti già caricati.'
+    return
+  }
+  try {
+    const { people } = peopleFromSource({
+      rows: excelRows.value,
+      headers: excelHeaders.value,
+      mapping: columnMapping.value,
+      overrides: transparencyRoleOverrides.value,
+    })
+    simResult.value = simulateHire({
+      people,
+      overrides: transparencyRoleOverrides.value,
+      form: { ...simForm.value },
+    })
+  } catch (err) {
+    simError.value = err?.message || String(err)
+  }
+}
+
+function isGapAlert(pct) {
+  return pct != null && Math.abs(pct) > 5
+}
+
+function isPersonJustified(person) {
+  const key = String(person?.index || '')
+  if (!key) return false
+  const note = personJustifications.value[key]
+  return typeof note === 'string' && note.trim().length > 0
+}
+
+function personComparisonSalary(person) {
+  return getComparisonValue(person, euDashboardMetric.value)
+}
+
+/** Retribuzione oraria per GPG CCNL (Dir. UE 2023/970: denominatore = media oraria uomini). */
+function personCcnlGapSalary(person) {
+  return getComparisonValue(person, euDashboardMetric.value, { hourly: true })
+}
+
+function gapAnalysisOptionsForGroup(people, hasJustification = false) {
+  return {
+    getSalary: personComparisonSalary,
+    isExcludedFromGap: (p) => isPersonJustified(p) || isQuartileAnalysisExcluded(p?.index),
+    hasJustification,
+  }
+}
+
+function analyzeHayBandGap(hayBand) {
+  const hasJustification = hayBandHasJustifications(hayBand)
+  return analyzeGenderPayGap(hayBand?.people || [], gapAnalysisOptionsForGroup(hayBand?.people, hasJustification))
+}
+
+function hayBandAdjustedGapPct(hayBand) {
+  return analyzeHayBandGap(hayBand).gapMean
+}
+
+function hayBandGapStatus(hayBand) {
+  return analyzeHayBandGap(hayBand).status
+}
+
+function hayBandGapStatusClass(hayBand) {
+  return gapStatusCssClass(hayBandGapStatus(hayBand))
+}
+
+function hayBandHasJustifications(hayBand) {
+  return (hayBand?.people || []).some((p) => isPersonJustified(p))
+}
+
+function hasHayBandDisparity(hayBand) {
+  const st = hayBandGapStatus(hayBand)
+  return st === 'yellow' || st === 'red'
+}
+
+function groupGapStatusClass(row) {
+  return gapStatusCssClass(row?.status)
+}
+
+function groupHasActionableGap(row) {
+  return row && !row.insufficientSample && (row.status === 'yellow' || row.status === 'red')
+}
+
+const gapAnalysisOptions = computed(() => ({
+  getSalary: personComparisonSalary,
+  isExcludedFromGap: (p) => isPersonJustified(p) || isQuartileAnalysisExcluded(p?.index),
+  isPersonJustified,
+}))
+
+const ccnlGapAnalysisOptions = computed(() => ({
+  getSalary: personCcnlGapSalary,
+  isExcludedFromGap: (p) => isPersonJustified(p) || isQuartileAnalysisExcluded(p?.index),
+  isPersonJustified,
+}))
+
+const ccnlGroups = computed(() =>
+  computeCcnlGroupedComparison(
+    genderNormalizedForAnalysis.value,
+    ccnlGapAnalysisOptions.value,
+  ),
+)
+
+const hasMultipleCcnls = computed(() => ccnlGroups.value.length > 1)
+
+const ccnlLevelRows = computed(() => flattenCcnlLevelRows(ccnlGroups.value))
+
+const hasCostCenterData = computed(() =>
+  genderNormalizedForAnalysis.value.some((r) => String(r.category ?? '').trim()),
+)
+
+const costCenterRows = computed(() =>
+  computeCostCenterComparison(genderNormalizedForAnalysis.value, gapAnalysisOptions.value),
+)
+
+const costCenterGapHotspots = computed(() => computeGapHotspots(costCenterRows.value, { topN: 5 }))
+
+const expandedCostCenters = ref(new Set())
+
+function toggleCostCenter(key) {
+  const k = String(key || '')
+  if (expandedCostCenters.value.has(k)) expandedCostCenters.value.delete(k)
+  else expandedCostCenters.value.add(k)
+  expandedCostCenters.value = new Set(expandedCostCenters.value)
+}
+
+function isCostCenterExpanded(key) {
+  return expandedCostCenters.value.has(String(key || ''))
+}
+
+function justifyGroupContextNoun(source) {
+  if (source === 'ccnl_level') return 'livello'
+  if (source === 'cost_center') return 'centro di costo'
+  return 'fascia'
+}
+
+const expandedCcnlContracts = ref(new Set())
+const expandedCcnlLevels = ref(new Set())
+
+function ccnlLevelCompositeKey(group, row) {
+  return `${group.ccnlKey}::${row.levelKey}`
+}
+
+function toggleCcnlContract(ccnlKey) {
+  const k = String(ccnlKey || '')
+  if (expandedCcnlContracts.value.has(k)) expandedCcnlContracts.value.delete(k)
+  else expandedCcnlContracts.value.add(k)
+  expandedCcnlContracts.value = new Set(expandedCcnlContracts.value)
+}
+
+function isCcnlContractExpanded(ccnlKey) {
+  return expandedCcnlContracts.value.has(String(ccnlKey || ''))
+}
+
+function toggleCcnlLevel(compositeKey) {
+  const key = String(compositeKey || '')
+  if (expandedCcnlLevels.value.has(key)) expandedCcnlLevels.value.delete(key)
+  else expandedCcnlLevels.value.add(key)
+  expandedCcnlLevels.value = new Set(expandedCcnlLevels.value)
+}
+
+function isCcnlLevelExpanded(compositeKey) {
+  return expandedCcnlLevels.value.has(String(compositeKey || ''))
+}
+
+function ccnlLevelGapStatusClass(row) {
+  return groupGapStatusClass(row)
+}
+
+function ccnlLevelHasActionableGap(row) {
+  return row && !row.insufficientSample && row.status === 'red'
+}
+
+function formatDeviationVsGenderGroupMean(person) {
+  const v = person?.deviationFromGenderMeanPct
+  if (v == null || !Number.isFinite(v)) return '–'
+  const sign = v > 0 ? '+' : ''
+  return `${sign}${v.toFixed(1)}%`
+}
+
+function resolveCcnlLabel() {
+  const counts = new Map()
+  for (const r of genderNormalizedCache.value || []) {
+    const c = r?.ccnl != null ? String(r.ccnl).trim() : ''
+    if (!c) continue
+    counts.set(c, (counts.get(c) || 0) + 1)
+  }
+  if (!counts.size) return ''
+  return [...counts.entries()].sort((a, b) => b[1] - a[1])[0][0]
+}
+
+function buildGapReportPayloadForExport() {
+  const now = new Date()
+  const dash = euDashboard.value || {}
+  const ccnlWithJ = attachJustificationsToRows(ccnlLevelRows.value, personJustifications.value)
+  const groupsAbove = buildGroupsAboveThreshold({ ccnlRows: ccnlWithJ })
+  const groupCounts = summarizeGroupCounts(groupsAbove)
+  const hotspots = buildExposureHotspots(ccnlWithJ, 5)
+
+  const fasciaRows = []
+  for (const sub of jobFasce.value) {
+    const stats = analyzeHayBandGap(sub)
+    fasciaRows.push({
+      levelLabel: fasciaLevelsLabel(sub),
+      fasciaId: sub.id,
+      fasciaLabel: sub.label,
+      nM: stats.nM,
+      nF: stats.nF,
+      gapMean: stats.gapMean,
+      gapMedian: stats.gapMedian,
+      status: stats.status,
+      insufficientSample: stats.insufficientSample,
+    })
+  }
+
+  const methodNote =
+    'Confronti retributivi normalizzati full-time equivalent (FTE). ' +
+    `Metrica attiva: ${euMetricLabel.value}.`
+
+  return {
+    companyName: reportCompanyName.value.trim() || 'Azienda',
+    ccnlName: resolveCcnlLabel() || '–',
+    referencePeriod: reportReferencePeriod.value.trim() || `Anno ${now.getFullYear()}`,
+    generatedAtIso: now.toISOString(),
+    generatedAtLabel: now.toLocaleString('it-IT'),
+    version: GAP_REPORT_VERSION,
+    metric: euDashboardMetric.value,
+    metricLabel: `${euMetricLabel.value} (normalizzato FTE)`,
+    fte: true,
+    nEmployees: dash.nTotaleAnalizzati ?? genderNormalizedForAnalysis.value.length,
+    methodNote,
+    executiveSummary: {
+      gapMean: dash.gapMean,
+      gapMedian: dash.gapMedian,
+      gapVarMean: dash.gapVarMean,
+      gapVarMedian: dash.gapVarMedian,
+      pctMenWithVar: dash.pctMenWithVar,
+      pctWomenWithVar: dash.pctWomenWithVar,
+      groupCounts,
+      hotspots,
+    },
+    ccnlLevels: ccnlWithJ.map(({ people, _personJustifications, ...r }) => r),
+    quartiles: dash.quartiles || [],
+    groupsAboveThreshold: groupsAbove,
+    integrative: {
+      includeFascia: reportIncludeFascia.value,
+      includeCostCenter: reportIncludeCostCenter.value && hasCostCenterData.value,
+      fasciaRows,
+      costCenterRows: costCenterRows.value.map(({ people, ...r }) => r),
+      costCenterHotspots: costCenterGapHotspots.value,
+    },
+  }
+}
+
+function findCcnlLevelRowForPerson(person) {
+  const ccnlKey = String(person?.ccnl ?? '').trim() || 'N/D'
+  const levelKey = normalizeLevelLabel(person?.level) || 'N/D'
+  const group = ccnlGroups.value.find((g) => g.ccnlKey === ccnlKey)
+  const row = group?.levels?.find((l) => l.levelKey === levelKey)
+  if (!row) return { group, row: null, ccnlKey, levelKey }
+  return {
+    group,
+    row: {
+      ...row,
+      ccnlLabel: group.ccnlLabel,
+      levelLabel: row.levelLabel || levelKey,
+    },
+    ccnlKey,
+    levelKey,
+  }
+}
+
+function findPersonByIndex(index) {
+  const key = String(index ?? '')
+  if (!key) return null
+  for (const band of jobResults.value || []) {
+    for (const p of band.people || []) {
+      if (String(p.index) === key) return p
+    }
+  }
+  return null
+}
+
+async function exportPayCommunicationPdf(person) {
+  if (payCommLoadingIndex.value != null || !person) return
+  const { row } = findCcnlLevelRowForPerson(person)
+  if (!row) {
+    uploadError.value =
+      'Impossibile generare la comunicazione: livello CCNL o contratto non individuato per questo dipendente.'
+    return
+  }
+  payCommLoadingIndex.value = person.index
+  uploadError.value = ''
+  try {
+    const payload = buildPayCommunicationPayload({
+      person,
+      levelRow: row,
+      companyName: reportCompanyName.value,
+      referencePeriod: reportReferencePeriod.value,
+      criteriaText: DEFAULT_PAY_CRITERIA_TEXT,
+      minSample: MIN_GENDER_SAMPLE,
+    })
+    const res = await fetch('/api/report/pay-communication', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    if (!res.ok) {
+      let msg = `Errore ${res.status}`
+      try {
+        const j = await res.json()
+        if (j?.error) msg = j.error
+      } catch {
+        msg = await res.text()
+      }
+      throw new Error(msg)
+    }
+    const blob = await res.blob()
+    const stamp = payload.generatedAtIso.slice(0, 10)
+    const slug = String(payload.employee?.name || person.index)
+      .replace(/[^\w\-àèéìòù]/gi, '-')
+      .replace(/-+/g, '-')
+      .slice(0, 40)
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `comunicazione-retributiva-${slug}-${stamp}.pdf`
+    a.click()
+    URL.revokeObjectURL(url)
+    saveStatus.value = `Comunicazione PDF generata per ${payload.employee.name}.`
+  } catch (err) {
+    uploadError.value =
+      'Generazione comunicazione non riuscita: ' +
+      (err?.message || String(err)) +
+      (geminiApiUnreachable.value ? ' (avvia con vercel dev per le route API)' : '')
+  } finally {
+    payCommLoadingIndex.value = null
+  }
+}
+
+async function exportPayCommunicationForJustifyingPerson() {
+  const key = justifyingPerson.value?.key
+  if (!key) return
+  const person = findPersonByIndex(key)
+  if (!person) {
+    uploadError.value = 'Impossibile generare la comunicazione: dati dipendente non trovati.'
+    return
+  }
+  await exportPayCommunicationPdf(person)
+}
+
+async function exportGapReportPdf() {
+  if (gapReportExportLoading.value) return
+  if (!genderNormalizedForAnalysis.value.length) {
+    uploadError.value = 'Nessun dato da esportare: completa l\'analisi con dipendenti M/F.'
+    return
+  }
+  gapReportExportLoading.value = true
+  uploadError.value = ''
+  try {
+    const payload = buildGapReportPayloadForExport()
+    const res = await fetch('/api/report/gap-analysis', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    if (!res.ok) {
+      let msg = `Errore ${res.status}`
+      try {
+        const j = await res.json()
+        if (j?.error) msg = j.error
+      } catch {
+        msg = await res.text()
+      }
+      throw new Error(msg)
+    }
+    const blob = await res.blob()
+    const stamp = payload.generatedAtIso.slice(0, 10)
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `report-divario-retributivo-${stamp}.pdf`
+    a.click()
+    URL.revokeObjectURL(url)
+    saveStatus.value = 'Report PDF generato.'
+  } catch (err) {
+    uploadError.value =
+      'Esportazione PDF non riuscita: ' +
+      (err?.message || String(err)) +
+      (geminiApiUnreachable.value ? ' (avvia con vercel dev per le route API)' : '')
+  } finally {
+    gapReportExportLoading.value = false
+  }
+}
+
+function personGenderClass(gender) {
+  if (gender === 'M') return 'gender-male'
+  if (gender === 'F') return 'gender-female'
+  return 'gender-unknown'
+}
+
+const expandedHayBands = ref(new Set())
+const expandedRoleDetails = ref(new Set())
+
+function hayBandKey(level, label) {
+  return `${level}::${label}`
+}
+
+function expandAllRolesForFascia(level, subLabel, roles) {
+  const next = new Set(expandedRoleDetails.value)
+  for (const rb of roles || []) {
+    if (rb?.role != null) next.add(roleDetailKey(level, subLabel, rb.role))
+  }
+  expandedRoleDetails.value = next
+}
+
+function collapseAllRolesForFascia(level, subLabel, roles) {
+  const next = new Set(expandedRoleDetails.value)
+  for (const rb of roles || []) {
+    if (rb?.role != null) next.delete(roleDetailKey(level, subLabel, rb.role))
+  }
+  expandedRoleDetails.value = next
+}
+
+/** Aprendo una fascia si espandono anche tutti i ruoli (lista persone visibile); chiudendo si collassano. */
+function toggleHayBand(level, label, sub) {
+  const key = hayBandKey(level, label)
+  const roles = sub?.roles
+  if (expandedHayBands.value.has(key)) {
+    expandedHayBands.value.delete(key)
+    collapseAllRolesForFascia(level, label, roles)
+  } else {
+    expandedHayBands.value.add(key)
+    expandAllRolesForFascia(level, label, roles)
+  }
+  expandedHayBands.value = new Set(expandedHayBands.value)
+}
+
+function isHayBandExpanded(level, label) {
+  return expandedHayBands.value.has(hayBandKey(level, label))
+}
+
+function roleDetailKey(level, subLabel, role) {
+  return `${level}::${subLabel}::${role}`
+}
+
+function toggleRoleDetail(level, subLabel, role) {
+  const key = roleDetailKey(level, subLabel, role)
+  if (expandedRoleDetails.value.has(key)) expandedRoleDetails.value.delete(key)
+  else expandedRoleDetails.value.add(key)
+  expandedRoleDetails.value = new Set(expandedRoleDetails.value)
+}
+
+function isRoleDetailExpanded(level, subLabel, role) {
+  return expandedRoleDetails.value.has(roleDetailKey(level, subLabel, role))
+}
+
+function runJobGrading() {
+  const normalizedJob = buildNormalizedJobGradingData(excelRows.value, excelHeaders.value, columnMapping.value)
+  const normalizedGender = buildNormalizedData(excelRows.value, excelHeaders.value, columnMapping.value)
+  const genderByIndex = new Map(normalizedGender.map((x) => [x.index, x.gender]))
+  const enrichedJob = normalizedJob.map((p) => ({
+    ...p,
+    gender: p.gender || genderByIndex.get(p.index) || null,
+  }))
+  if (normalizedJob.length > 0) {
+    const grouped = groupByLevel(enrichedJob, transparencyRoleOverrides.value)
+    jobResults.value = enrichWithDeviation(grouped)
+  } else {
+    jobResults.value = []
+  }
+}
+
+function suggestedAnalysisName() {
+  const fileName = excelFile.value?.name
+  if (fileName) return fileName.replace(/\.(xlsx|xls|csv)$/i, '')
+  const raw = String(excelUrl.value || '').trim()
+  if (!raw) return ''
+  if (raw.startsWith('file:')) return raw.slice(5).replace(/\.(xlsx|xls|csv)$/i, '')
+  try {
+    const last = new URL(raw).pathname.split('/').filter(Boolean).pop()
+    return decodeURIComponent(last || '').replace(/\.(xlsx|xls|csv)$/i, '')
+  } catch {
+    return raw
+  }
+}
+
+function analysisNameForSave() {
+  const typed = String(analysisSaveName.value || '').trim()
+  const name = typed || suggestedAnalysisName() || 'Analisi'
+  return name.slice(0, 120)
+}
+
+async function persistCurrentAnalysis() {
+  if (!excelRows.value.length) {
+    saveStatusIsError.value = true
+    saveStatus.value = 'Nessun dato da salvare nello storico.'
+    return null
+  }
+  const name = analysisNameForSave()
+  analysisSaveName.value = name
+  historySaving.value = true
+  try {
+    const snapshot = buildAnalysisSnapshot({ jobResults: jobResults.value })
+    const record = await saveAnalysis({
+      analysisType: 'combined',
+      name,
+      sourceUrl: excelUrl.value || (excelFile.value ? `file:${excelFile.value.name}` : ''),
+      headers: excelHeaders.value,
+      mapping: columnMapping.value,
+      rows: excelRows.value,
+      snapshot,
+      overrides: transparencyRoleOverrides.value,
+      calculationSource: `gender:${indicatorsSource.value},job:locale`,
+    })
+    saveStatusIsError.value = false
+    const n = snapshot?.n || excelRows.value.length
+    saveStatus.value = `«${name}» salvata nello storico (${n} dipendenti con retribuzione valida).`
+    storicoList.value = await fetchAnalyses()
+    return record
+  } catch (err) {
+    saveStatusIsError.value = true
+    saveStatus.value = `Analisi non salvata: ${err?.message || String(err)}`
+    return null
+  } finally {
+    historySaving.value = false
+  }
+}
+
+// Flusso unificato
+function startNuovaAnalisi() {
+  activeSection.value = 'analisi'
+  analisiStep.value = 'upload'
+  uploadError.value = ''
+  excelUrl.value = ''
+  excelFile.value = null
+  analysisSaveName.value = ''
+  if (excelFileInputRef.value) excelFileInputRef.value.value = ''
+  geminiInfoNotice.value = ''
+  indicatorsResult.value = null
+  jobResults.value = []
+  saveStatus.value = ''
+  saveStatusIsError.value = false
+  justifications.value = {}
+  justifyingLevel.value = null
+  genderViewMode.value = 'media'
+  genderNormalizedCache.value = []
+  quartileOutlierJustifications.value = {}
+  transparencyRoleOverrides.value = {}
+  bandGenderJustifications.value = {}
+  resultsTab.value = 'eu_dashboard'
+  euDashboardMetric.value = SALARY_METRICS.base
+  justifyingPerson.value = null
+  expandedCcnlContracts.value = new Set()
+  expandedCcnlLevels.value = new Set()
+  expandedCostCenters.value = new Set()
+}
+
+function goToMappingFromResults() {
+  analisiStep.value = 'mapping'
+  justifyingPerson.value = null
+  justifyText.value = ''
+}
+
+function goToUpload() {
+  analisiStep.value = 'upload'
+  uploadError.value = ''
+  geminiInfoNotice.value = ''
+}
+
+async function onLoadFromUrl() {
+  const url = (excelUrl.value || '').trim()
+  if (!url) { uploadError.value = 'Inserisci il collegamento al file Excel.'; return }
+  uploadError.value = ''
+  geminiInfoNotice.value = ''
+  uploadLoading.value = true
+  geminiLoading.value = false
+  try {
+    const { rows, headers } = await parseExcelFromUrl(url)
+    excelFile.value = null
+    if (excelFileInputRef.value) excelFileInputRef.value.value = ''
+    await processLoadedWorkbook(rows, headers)
+  } catch (err) {
+    uploadError.value = err.message || 'Impossibile leggere il file.'
+  } finally { uploadLoading.value = false }
+}
+
+async function onLoadFromFile() {
+  if (uploadLoading.value || geminiLoading.value) return
+  const file = excelFile.value
+  if (!file) {
+    uploadError.value = 'Seleziona un file Excel o CSV.'
+    return
+  }
+  uploadError.value = ''
+  geminiInfoNotice.value = ''
+  uploadLoading.value = true
+  geminiLoading.value = false
+  try {
+    const { rows, headers } = await parseExcelFromFile(file)
+    excelUrl.value = ''
+    await processLoadedWorkbook(rows, headers)
+  } catch (err) {
+    uploadError.value = err.message || 'Impossibile leggere il file selezionato.'
+  } finally { uploadLoading.value = false }
+}
+
+function onExcelFileChange(ev) {
+  const file = ev?.target?.files?.[0] || null
+  excelFile.value = file
+}
+
+async function processLoadedWorkbook(rows, headers) {
+    excelRows.value = rows
+    excelHeaders.value = headers
+    quartileOutlierJustifications.value = {}
+    transparencyRoleOverrides.value = {}
+    const heuristic = detectColumnRoles(headers, rows)
+    let suggested = { ...heuristic }
+    if (geminiEnabled.value) {
+      geminiLoading.value = true
+      try {
+        const aiMapping = await suggestColumnMappingWithGemini(headers, rows)
+        if (aiMapping && Object.keys(aiMapping).length > 0)
+          suggested = mergeColumnMappings(heuristic, aiMapping, headers)
+      } catch (geminiErr) {
+        geminiInfoNotice.value =
+          'Riconoscimento AI non disponibile (' +
+          (geminiErr.message || String(geminiErr)) +
+          '). È attivo il mapping automatico delle colonne: controllalo e correggilo se serve.'
+      } finally { geminiLoading.value = false }
+    } else {
+      if (geminiApiUnreachable.value) {
+        geminiInfoNotice.value =
+          'Claude non disponibile: in ambiente di sviluppo le route /api/gemini non sono servite da Vite. Usa il mapping euristico oppure avvia il progetto con `vercel dev` (con variabile ANTHROPIC_API_KEY) oppure configura la chiave sul deploy.'
+      } else {
+        geminiInfoNotice.value =
+          'Claude non attivo: imposta la variabile ANTHROPIC_API_KEY (console.anthropic.com) nel pannello Environment Variables del deploy (es. Vercel → Settings → Environment Variables). È attivo il mapping euristico delle colonne.'
+      }
+    }
+    columnMapping.value = suggested
+    analisiStep.value = 'mapping'
+}
+
+async function confirmMapping() {
+  if (analysisLoading.value) return
+  const missing = missingRequiredMappingRoles(columnMapping.value)
+  if (missing.length) {
+    uploadError.value =
+      'Mappa le colonne obbligatorie: ' + missing.map(getRoleLabel).join(', ') + '.'
+    return
+  }
+  analysisLoading.value = true
+  uploadError.value = ''
+  justifyingPerson.value = null
+  try {
+    // --- Analisi di genere ---
+    const normalizedGender = buildNormalizedData(excelRows.value, excelHeaders.value, columnMapping.value)
+    if (normalizedGender.length > 0) {
+      const localIndicators = computeIndicators(normalizedGender, {
+        metric: euDashboardMetric.value,
+      })
+      if (geminiEnabled.value) {
+        geminiLoading.value = true
+        try {
+          const aiIndicators = await computeIndicatorsWithGemini(normalizedGender)
+          // I numeri degli indicatori devono restare quelli calcolati in locale: Claude vede solo un campione
+          // e può restituire valori errati (es. N M = 0). Eventuali campi testuali dall'AI restano sotto le chiavi locali.
+          indicatorsResult.value = {
+            ...localIndicators,
+            a_divarioRetributivoGenere: {
+              ...(aiIndicators?.a_divarioRetributivoGenere || {}),
+              ...localIndicators.a_divarioRetributivoGenere,
+            },
+            b_divarioComponentiVariabili: {
+              ...(aiIndicators?.b_divarioComponentiVariabili || {}),
+              ...localIndicators.b_divarioComponentiVariabili,
+            },
+            c_divarioMedianoGenere: {
+              ...(aiIndicators?.c_divarioMedianoGenere || {}),
+              ...localIndicators.c_divarioMedianoGenere,
+            },
+            d_divarioMedianoComponentiVariabili: {
+              ...(aiIndicators?.d_divarioMedianoComponentiVariabili || {}),
+              ...localIndicators.d_divarioMedianoComponentiVariabili,
+            },
+            e_percentualeConComponentiVariabili: {
+              ...(aiIndicators?.e_percentualeConComponentiVariabili || {}),
+              ...localIndicators.e_percentualeConComponentiVariabili,
+            },
+            f_percentualePerQuartile: {
+              ...(aiIndicators?.f_percentualePerQuartile || {}),
+              ...localIndicators.f_percentualePerQuartile,
+              quartili: localIndicators.f_percentualePerQuartile.quartili,
+            },
+            g_divarioPerCategoria: {
+              ...(aiIndicators?.g_divarioPerCategoria || {}),
+              ...localIndicators.g_divarioPerCategoria,
+              perCategoria: localIndicators.g_divarioPerCategoria.perCategoria,
+            },
+            h_divarioRetribuzioneBase: {
+              ...(aiIndicators?.h_divarioRetribuzioneBase || {}),
+              ...localIndicators.h_divarioRetribuzioneBase,
+            },
+          }
+          indicatorsSource.value = 'ai'
+        } catch (aiErr) {
+          indicatorsResult.value = localIndicators
+          indicatorsSource.value = 'locale'
+          uploadError.value = 'Calcolo AI non riuscito, uso fallback locale: ' + (aiErr.message || String(aiErr))
+        } finally { geminiLoading.value = false }
+      } else {
+        indicatorsResult.value = localIndicators
+        indicatorsSource.value = 'locale'
+      }
+    } else {
+      indicatorsResult.value = null
+    }
+
+    // --- Job grading (lavori di pari valore) ---
+    runJobGrading()
+
+    if (!indicatorsResult.value && jobResults.value.length === 0) {
+      uploadError.value = 'Nessun dato valido. Verifica il mapping delle colonne per il job grading.'
+      return
+    }
+
+    // Gender gap per band & gap rettificato
+    genderNormalizedCache.value = normalizedGender
+    bandGenderJustifications.value = {}
+    quartileOutlierJustifications.value = {}
+    transparencyRoleOverrides.value = {}
+
+    await persistCurrentAnalysis()
+
+    resultsTab.value = 'eu_dashboard'
+    analisiStep.value = 'results'
+  } finally { analysisLoading.value = false }
+}
+
+function formatPct(n) { return n == null ? '–' : n.toFixed(2) + '%' }
+
+function formatPctSigned(n) {
+  if (n == null || !Number.isFinite(n)) return '–'
+  const sign = n > 0 ? '+' : ''
+  return `${sign}${n.toFixed(1)}%`
+}
+/** Scostamento % retribuzione totale vs media della fascia (stesso bucket punteggio) */
+function formatDeviationVsBandMean(p) {
+  return formatPctSigned(p?.deviationFromHayBandMeanPct)
+}
+function personPerformanceScore(person) {
+  const v = Number(person?.performanceScore)
+  return Number.isFinite(v) && v > 0 ? v : null
+}
+
+/** Gap da pctGap / media M vs F: positivo = uomini pagati di più, negativo = donne pagate di più */
+function formatGapMforF(gap, hasJustification = false) {
+  if (gap == null || !Number.isFinite(gap)) return '–'
+  const a = Math.abs(gap)
+  let body
+  if (a < 1e-9) body = '0%'
+  else {
+    const letter = gap > 0 ? 'M' : 'F'
+    body = `${letter} + ${a.toFixed(2)}%`
+  }
+  const rettificato =
+    hasJustification && Number.isFinite(gap) && Math.abs(gap) <= EU_GAP_THRESHOLD_PCT
+  const lead = rettificato ? 'Gap rett.: ' : 'Gap: '
+  return `${lead}${body}`
+}
+function formatNum(n) { return n == null ? '–' : Number(n).toLocaleString('it-IT', { maximumFractionDigits: 2 }) }
+
+/** Altezza barra quartili in px (evita % errate nei flex item) */
+const EU_QUARTILE_BAR_TRACK_PX = 100
+function quartileBarHeightPx(pct) {
+  const p = Number(pct)
+  if (!Number.isFinite(p) || p <= 0) return '2px'
+  const px = Math.round((p / 100) * EU_QUARTILE_BAR_TRACK_PX)
+  return `${Math.max(2, px)}px`
+}
+function clampScoreInput(v) {
+  const n = Number(v)
+  if (!Number.isFinite(n)) return 0
+  return Math.max(0, Math.min(100, Math.round(n)))
+}
+function clampTrScore(v) {
+  const n = Number(v)
+  if (!Number.isFinite(n)) return 50
+  return Math.max(0, Math.min(100, Math.round(n)))
+}
+function emptyRoleTransparencyForm() {
+  const o = {}
+  for (const f of TRANSPARENCY_FLAT_FACTORS) {
+    o[f.id] = 50
+  }
+  return o
+}
+/** Form modifica punteggi nel popup Dettaglio valutazione */
+const roleValuationForm = ref(emptyRoleTransparencyForm())
+function roleTr(role, factorId) {
+  if (!role) return null
+  return role[trFieldName(factorId)]
+}
+/** Punti parametrici 0–100 per macro-area: Σ (% peso fattore × punteggio / 100). */
+function roleMacroAreaParametricPoints(role, area) {
+  if (!role || !area?.factors?.length) return null
+  let pts = 0
+  let any = false
+  for (const f of area.factors) {
+    const s = roleTr(role, f.id)
+    if (s == null || !Number.isFinite(Number(s))) continue
+    any = true
+    pts += transparencyParametricPointsFromFactor(Number(s), f.weightPct)
+  }
+  return any ? Math.round(pts * 100) / 100 : null
+}
+function macroAreaMaxParametricPoints(area) {
+  return area.factors.reduce((sum, f) => sum + f.weightPct, 0)
+}
+function macroAreaParametricTooltip(role, area) {
+  const pts = roleMacroAreaParametricPoints(role, area)
+  if (pts == null) return ''
+  const max = macroAreaMaxParametricPoints(area)
+  return `Punti parametrici (scala 0–100): Σ (% peso × punteggio / 100) per i fattori dell’area. Massimo ${max} se tutti i punteggi sono 100.`
+}
+function formatMacroAreaScore(role, area) {
+  const s = roleMacroAreaParametricPoints(role, area)
+  return s == null ? '–' : formatNum(s)
+}
+function previewValuationFormWeighted() {
+  let w = 0
+  for (const f of TRANSPARENCY_FLAT_FACTORS) {
+    w += clampTrScore(roleValuationForm.value[f.id]) * (f.weightPct / 100)
+  }
+  return Math.round(w * 100) / 100
+}
+function previewValuationFormParametric100() {
+  let pts = 0
+  for (const f of TRANSPARENCY_FLAT_FACTORS) {
+    pts += transparencyParametricPointsFromFactor(clampTrScore(roleValuationForm.value[f.id]), f.weightPct)
+  }
+  return Math.round(pts * 100) / 100
+}
+/** Contributo da form modifica (popup dettaglio) */
+function formatFactorParametricContributionFromForm(factor) {
+  const v = transparencyParametricPointsFromFactor(clampTrScore(roleValuationForm.value[factor.id]), factor.weightPct)
+  return formatNum(v)
+}
+/** Contributo singolo fattore su scala 100: % peso × punteggio / 100 */
+function formatFactorParametricContribution(role, factor) {
+  const s = roleTr(role, factor.id)
+  if (s == null || !Number.isFinite(Number(s))) return '–'
+  const v = transparencyParametricPointsFromFactor(Number(s), factor.weightPct)
+  return formatNum(v)
+}
+function meanLocal(values) {
+  if (!values?.length) return 0
+  return values.reduce((sum, v) => sum + Number(v || 0), 0) / values.length
+}
+// Giustificativi per livelli fuori soglia
+const justifications = ref({})
+const justifyingLevel = ref(null)
+const justifyText = ref('')
+const personJustifications = ref({})
+const justifyingPerson = ref(null)
+
+function openJustify(level) {
+  justifyingLevel.value = level
+  justifyText.value = justifications.value[level] || ''
+}
+
+function saveJustify() {
+  if (justifyingLevel.value != null) {
+    justifications.value[justifyingLevel.value] = justifyText.value
+  }
+  justifyingLevel.value = null
+  justifyText.value = ''
+}
+
+function cancelJustify() {
+  justifyingLevel.value = null
+  justifyText.value = ''
+}
+
+function openCcnlPersonJustify(person, levelRow) {
+  const key = String(person?.index || '')
+  if (!key || !levelRow) return
+
+  const peopleInLevel = levelRow.people?.length ? levelRow.people : [person]
+  const seniorityYearsList = peopleInLevel
+    .map((p) => seniorityToYearsNumeric(p.seniority))
+    .filter((n) => n != null && Number.isFinite(n) && n >= 0)
+  const levelAvgSeniorityYears = seniorityYearsList.length ? meanLocal(seniorityYearsList) : null
+  const seniorityYearsRaw = seniorityToYearsNumeric(person?.seniority)
+  const seniorityPctVsLevel =
+    levelAvgSeniorityYears != null &&
+    levelAvgSeniorityYears > 0 &&
+    seniorityYearsRaw != null &&
+    Number.isFinite(seniorityYearsRaw)
+      ? ((seniorityYearsRaw - levelAvgSeniorityYears) / levelAvgSeniorityYears) * 100
+      : null
+
+  const perfScores = peopleInLevel.map((p) => personPerformanceScore(p)).filter((v) => v != null)
+  const levelAvgPerformance = perfScores.length ? meanLocal(perfScores) : null
+  const performanceScore = personPerformanceScore(person)
+
+  const roleSeniorityYearsRaw = seniorityToYearsNumeric(person?.roleSeniority)
+  const roleSeniorityYearsList = peopleInLevel
+    .map((p) => seniorityToYearsNumeric(p.roleSeniority))
+    .filter((n) => n != null && Number.isFinite(n) && n >= 0)
+  const levelAvgRoleSeniorityYears = roleSeniorityYearsList.length
+    ? meanLocal(roleSeniorityYearsList)
+    : null
+  const roleSeniorityPctVsLevel =
+    levelAvgRoleSeniorityYears != null &&
+    levelAvgRoleSeniorityYears > 0 &&
+    roleSeniorityYearsRaw != null &&
+    Number.isFinite(roleSeniorityYearsRaw)
+      ? ((roleSeniorityYearsRaw - levelAvgRoleSeniorityYears) / levelAvgRoleSeniorityYears) * 100
+      : null
+  const performancePctVsLevel =
+    levelAvgPerformance != null &&
+    levelAvgPerformance > 0 &&
+    performanceScore != null
+      ? ((performanceScore - levelAvgPerformance) / levelAvgPerformance) * 100
+      : null
+
+  const displayName =
+    person?.name && String(person.name).trim()
+      ? String(person.name).trim()
+      : `Dipendente #${key}`
+  const gapPct = levelRow.gapMean
+  const jgCtx = findJobGradingContextByIndex(person?.index)
+  const roleBlock = jgCtx?.roleBlock ?? null
+
+  justifyingPerson.value = {
+    key,
+    displayName,
+    label: `${person?.role || '–'} · ${displayName}`,
+    seniority: person?.seniority || null,
+    seniorityYearsRaw,
+    fascAvgSeniorityYears: levelAvgSeniorityYears,
+    seniorityPctVsFascia: seniorityPctVsLevel,
+    roleSeniority: person?.roleSeniority || null,
+    roleSeniorityYearsRaw,
+    fascAvgRoleSeniorityYears: levelAvgRoleSeniorityYears,
+    roleSeniorityPctVsFascia: roleSeniorityPctVsLevel,
+    performanceScore,
+    fascAvgPerformance: levelAvgPerformance,
+    performancePctVsFascia: performancePctVsLevel,
+    roleName: person?.role || '–',
+    bandNum: levelRow.bandNum,
+    levelLabel: levelRow.displayLevelLabel || levelRow.levelLabel,
+    ccnlLabel: levelRow.ccnlLabel || '–',
+    fasciaId: null,
+    fasciaRange: null,
+    baseSalary: person.baseSalary,
+    variableComponents: person.variableComponents,
+    totalSalary: person.totalSalary,
+    gender: person.gender,
+    roleScoresBlock: roleBlock,
+    trWeightedScore: roleBlock?.trWeightedScore ?? null,
+    trParametricScore100: roleBlock?.trParametricScore100 ?? null,
+    gapFasciaPct: gapPct,
+    gapFasciaFormatted: gapPct != null ? formatGapMforF(gapPct, levelRow.hasJustification) : '–',
+    avgFasciaSalary: null,
+    personDeviationFromFasciaPct: person.deviationFromGenderMeanPct ?? null,
+    avgSalaryMen: levelRow.avgM,
+    avgSalaryWomen: levelRow.avgF,
+    nMenFascia: levelRow.nM ?? 0,
+    nWomenFascia: levelRow.nF ?? 0,
+    justifySource: 'ccnl_level',
+  }
+  resultsTabBeforeJustify.value = resultsTab.value
+  resultsTab.value = 'person_justify'
+  justifyText.value = personJustifications.value[key] || ''
+  nextTick(() => {
+    mainWrapRef.value?.scrollTo({ top: 0, behavior: 'smooth' })
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+  })
+}
+
+function openCostCenterPersonJustify(person, centerRow) {
+  const key = String(person?.index || '')
+  if (!key || !centerRow) return
+
+  const peopleInCenter = centerRow.people?.length ? centerRow.people : [person]
+  const seniorityYearsList = peopleInCenter
+    .map((p) => seniorityToYearsNumeric(p.seniority))
+    .filter((n) => n != null && Number.isFinite(n) && n >= 0)
+  const groupAvgSeniorityYears = seniorityYearsList.length ? meanLocal(seniorityYearsList) : null
+  const seniorityYearsRaw = seniorityToYearsNumeric(person?.seniority)
+  const seniorityPctVsGroup =
+    groupAvgSeniorityYears != null &&
+    groupAvgSeniorityYears > 0 &&
+    seniorityYearsRaw != null &&
+    Number.isFinite(seniorityYearsRaw)
+      ? ((seniorityYearsRaw - groupAvgSeniorityYears) / groupAvgSeniorityYears) * 100
+      : null
+
+  const perfScores = peopleInCenter.map((p) => personPerformanceScore(p)).filter((v) => v != null)
+  const groupAvgPerformance = perfScores.length ? meanLocal(perfScores) : null
+  const performanceScore = personPerformanceScore(person)
+
+  const roleSeniorityYearsRaw = seniorityToYearsNumeric(person?.roleSeniority)
+  const roleSeniorityYearsList = peopleInCenter
+    .map((p) => seniorityToYearsNumeric(p.roleSeniority))
+    .filter((n) => n != null && Number.isFinite(n) && n >= 0)
+  const groupAvgRoleSeniorityYears = roleSeniorityYearsList.length
+    ? meanLocal(roleSeniorityYearsList)
+    : null
+  const roleSeniorityPctVsGroup =
+    groupAvgRoleSeniorityYears != null &&
+    groupAvgRoleSeniorityYears > 0 &&
+    roleSeniorityYearsRaw != null &&
+    Number.isFinite(roleSeniorityYearsRaw)
+      ? ((roleSeniorityYearsRaw - groupAvgRoleSeniorityYears) / groupAvgRoleSeniorityYears) * 100
+      : null
+  const performancePctVsGroup =
+    groupAvgPerformance != null &&
+    groupAvgPerformance > 0 &&
+    performanceScore != null
+      ? ((performanceScore - groupAvgPerformance) / groupAvgPerformance) * 100
+      : null
+
+  const displayName =
+    person?.name && String(person.name).trim()
+      ? String(person.name).trim()
+      : `Dipendente #${key}`
+  const gapPct = centerRow.gapMean
+  const jgCtx = findJobGradingContextByIndex(person?.index)
+  const roleBlock = jgCtx?.roleBlock ?? null
+
+  justifyingPerson.value = {
+    key,
+    displayName,
+    label: `${person?.role || '–'} · ${displayName}`,
+    seniority: person?.seniority || null,
+    seniorityYearsRaw,
+    fascAvgSeniorityYears: groupAvgSeniorityYears,
+    seniorityPctVsFascia: seniorityPctVsGroup,
+    roleSeniority: person?.roleSeniority || null,
+    roleSeniorityYearsRaw,
+    fascAvgRoleSeniorityYears: groupAvgRoleSeniorityYears,
+    roleSeniorityPctVsFascia: roleSeniorityPctVsGroup,
+    performanceScore,
+    fascAvgPerformance: groupAvgPerformance,
+    performancePctVsFascia: performancePctVsGroup,
+    roleName: person?.role || '–',
+    bandNum: null,
+    levelLabel: person?.level || '–',
+    costCenterLabel: centerRow.costCenterLabel,
+    fasciaId: null,
+    fasciaRange: null,
+    baseSalary: person.baseSalary,
+    variableComponents: person.variableComponents,
+    totalSalary: person.totalSalary,
+    gender: person.gender,
+    roleScoresBlock: roleBlock,
+    trWeightedScore: roleBlock?.trWeightedScore ?? null,
+    trParametricScore100: roleBlock?.trParametricScore100 ?? null,
+    gapFasciaPct: gapPct,
+    gapFasciaFormatted: gapPct != null ? formatGapMforF(gapPct, centerRow.hasJustification) : '–',
+    avgFasciaSalary: null,
+    personDeviationFromFasciaPct: person.deviationFromGenderMeanPct ?? null,
+    avgSalaryMen: centerRow.avgM,
+    avgSalaryWomen: centerRow.avgF,
+    nMenFascia: centerRow.nM ?? 0,
+    nWomenFascia: centerRow.nF ?? 0,
+    justifySource: 'cost_center',
+  }
+  resultsTabBeforeJustify.value = resultsTab.value
+  resultsTab.value = 'person_justify'
+  justifyText.value = personJustifications.value[key] || ''
+  nextTick(() => {
+    mainWrapRef.value?.scrollTo({ top: 0, behavior: 'smooth' })
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+  })
+}
+
+function openPersonJustify(person, roleBlock, band, hayBand) {
+  const key = String(person?.index || '')
+  if (!key || !roleBlock || !band || !hayBand) return
+
+  const peopleInFascia =
+    hayBand?.people?.length ? hayBand.people : person ? [person] : []
+  const seniorityYearsList = peopleInFascia
+    .map((p) => seniorityToYearsNumeric(p.seniority))
+    .filter((n) => n != null && Number.isFinite(n) && n >= 0)
+  const fascAvgSeniorityYears = seniorityYearsList.length
+    ? meanLocal(seniorityYearsList)
+    : null
+  const seniorityYearsRaw = seniorityToYearsNumeric(person?.seniority)
+  const seniorityPctVsFascia =
+    fascAvgSeniorityYears != null &&
+    fascAvgSeniorityYears > 0 &&
+    seniorityYearsRaw != null &&
+    Number.isFinite(seniorityYearsRaw)
+      ? ((seniorityYearsRaw - fascAvgSeniorityYears) / fascAvgSeniorityYears) * 100
+      : null
+
+  const perfScores = peopleInFascia.map((p) => personPerformanceScore(p)).filter((v) => v != null)
+  const fascAvgPerformance = perfScores.length ? meanLocal(perfScores) : null
+  const performanceScore = personPerformanceScore(person)
+
+  const roleSeniorityYearsRaw = seniorityToYearsNumeric(person?.roleSeniority)
+  const roleSeniorityYearsList = peopleInFascia
+    .map((p) => seniorityToYearsNumeric(p.roleSeniority))
+    .filter((n) => n != null && Number.isFinite(n) && n >= 0)
+  const fascAvgRoleSeniorityYears = roleSeniorityYearsList.length
+    ? meanLocal(roleSeniorityYearsList)
+    : null
+  const roleSeniorityPctVsFascia =
+    fascAvgRoleSeniorityYears != null &&
+    fascAvgRoleSeniorityYears > 0 &&
+    roleSeniorityYearsRaw != null &&
+    Number.isFinite(roleSeniorityYearsRaw)
+      ? ((roleSeniorityYearsRaw - fascAvgRoleSeniorityYears) / fascAvgRoleSeniorityYears) * 100
+      : null
+  const performancePctVsFascia =
+    fascAvgPerformance != null &&
+    fascAvgPerformance > 0 &&
+    performanceScore != null
+      ? ((performanceScore - fascAvgPerformance) / fascAvgPerformance) * 100
+      : null
+
+  const displayName =
+    person?.name && String(person.name).trim()
+      ? String(person.name).trim()
+      : `Dipendente #${key}`
+  const gapPct = hayBandAdjustedGapPct(hayBand)
+
+  justifyingPerson.value = {
+    key,
+    displayName,
+    label: `${roleBlock.role} · ${displayName}`,
+    seniority: person?.seniority || null,
+    seniorityYearsRaw,
+    fascAvgSeniorityYears,
+    seniorityPctVsFascia,
+    roleSeniority: person?.roleSeniority || null,
+    roleSeniorityYearsRaw,
+    fascAvgRoleSeniorityYears,
+    roleSeniorityPctVsFascia,
+    performanceScore,
+    fascAvgPerformance,
+    performancePctVsFascia,
+    roleName: roleBlock.role,
+    bandNum: band.band,
+    levelLabel: roleBlock.level || band.level,
+    fasciaId: hayBand.id,
+    fasciaRange: hayBand.label,
+    baseSalary: person.baseSalary,
+    variableComponents: person.variableComponents,
+    totalSalary: person.totalSalary,
+    gender: person.gender,
+    roleScoresBlock: roleBlock,
+    trWeightedScore: roleBlock.trWeightedScore,
+    trParametricScore100: roleBlock.trParametricScore100,
+    gapFasciaPct: gapPct,
+    gapFasciaFormatted:
+      gapPct != null ? formatGapMforF(gapPct, hayBandHasJustifications(hayBand)) : '–',
+    /** Dati fascia per contesto giustificativo */
+    avgFasciaSalary: hayBand.avgTotalSalary ?? null,
+    personDeviationFromFasciaPct: person.deviationFromHayBandMeanPct ?? null,
+    avgSalaryMen: hayBand.avgSalaryMen,
+    avgSalaryWomen: hayBand.avgSalaryWomen,
+    nMenFascia: hayBand.nMen ?? 0,
+    nWomenFascia: hayBand.nWomen ?? 0,
+    justifySource: 'job_grading',
+  }
+  resultsTabBeforeJustify.value = resultsTab.value
+  resultsTab.value = 'person_justify'
+  justifyText.value = personJustifications.value[key] || ''
+  nextTick(() => {
+    mainWrapRef.value?.scrollTo({ top: 0, behavior: 'smooth' })
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+  })
+}
+
+function formatSeniorityDisplay(s) {
+  if (s == null || String(s).trim() === '') return '–'
+  return String(s).trim()
+}
+
+function formatHayBandAvgMen(sub) {
+  return (sub?.nMen ?? 0) > 0 ? formatNum(sub.avgSalaryMen) : '–'
+}
+
+function formatHayBandAvgWomen(sub) {
+  return (sub?.nWomen ?? 0) > 0 ? formatNum(sub.avgSalaryWomen) : '–'
+}
+
+const personJustifyFileInput = ref(null)
+
+function savePersonJustify() {
+  if (justifyingPerson.value?.key) {
+    const key = justifyingPerson.value.key
+    const text = justifyText.value
+    if (justifyingPerson.value.justifySource === 'quartile_outlier') {
+      const next = { ...quartileOutlierJustifications.value }
+      if (String(text || '').trim()) next[key] = text
+      else delete next[key]
+      quartileOutlierJustifications.value = next
+    } else {
+      personJustifications.value[key] = text
+    }
+  }
+  const back = resultsTabBeforeJustify.value || 'job_grading'
+  justifyingPerson.value = null
+  justifyText.value = ''
+  if (personJustifyFileInput.value) personJustifyFileInput.value.value = ''
+  resultsTab.value = back
+}
+
+function cancelPersonJustify() {
+  const back = resultsTabBeforeJustify.value || 'job_grading'
+  justifyingPerson.value = null
+  justifyText.value = ''
+  if (personJustifyFileInput.value) personJustifyFileInput.value.value = ''
+  resultsTab.value = back
+}
+
+const PERSON_JUSTIFY_DOC_INFO_SECTIONS = [
+  {
+    title: 'Competenze (Hard Skills)',
+    body: 'Certificazioni tecniche, titoli di studio specialistici (Master/PhD) e matrici di competenze validate.',
+  },
+  {
+    title: 'Performance (Merito)',
+    body: 'Schede di valutazione annuale firmate, report sul raggiungimento dei KPI e storici dei premi MBO.',
+  },
+  {
+    title: 'Esperienza (Seniority)',
+    body: 'CV che attestino l\'esperienza pregressa nel ruolo e storico dell\'anzianità aziendale.',
+  },
+  {
+    title: 'Condizioni di Lavoro',
+    body: 'Documenti che provino turni notturni, reperibilità h24, trasferte frequenti o responsabilità extra (es. coordinamento progetti).',
+  },
+  {
+    title: 'Mercato (Eccezioni)',
+    body: 'Report di benchmarking salariale esterno e documentazione sulla difficoltà di reperimento, se applicabile.',
+  },
+]
+
+function triggerPersonJustifyFile() {
+  personJustifyFileInput.value?.click()
+}
+
+function onPersonJustifyFilesSelected(ev) {
+  const input = ev.target
+  const files = input?.files
+  if (!files?.length || !justifyingPerson.value?.key) {
+    if (input) input.value = ''
+    return
+  }
+  const names = Array.from(files).map((f) => f.name).join(', ')
+  const note = `[Documenti allegati: ${names}]`
+  const cur = justifyText.value.trim()
+  justifyText.value = cur ? `${cur}\n\n${note}` : note
+  input.value = ''
+}
+
+// Gender gap dashboard
+const genderViewMode = ref('media') // 'media' | 'mediana'
+const genderNormalizedCache = ref([])
+const justifyingTeaPay = computed(() => {
+  const key = justifyingPerson.value?.key
+  if (key == null) return null
+  const full = genderNormalizedCache.value.find((r) => r.index === Number(key))
+  return teaPayComposition(full)
+})
+/** Dataset genere dopo esclusione dipendenti con giustificativo (outlier quartile o persona CCNL/fascia/CdC) */
+const genderNormalizedForAnalysis = computed(() =>
+  genderNormalizedCache.value.filter(
+    (r) => !isQuartileAnalysisExcluded(r.index) && !isPersonJustified(r),
+  ),
+)
+
+const bandGenderGaps = computed(() =>
+  computeBandGenderGaps(genderNormalizedForAnalysis.value, jobResults.value),
+)
+const adjustedGapResult = computed(() =>
+  computeAdjustedGap(genderNormalizedForAnalysis.value, 5),
+)
+
+const bandGenderJustifications = ref({})
+const expandedJustifyBand = ref(null)
+
+const euDashboard = computed(() =>
+  computeEuGenderDashboard(
+    genderNormalizedForAnalysis.value,
+    jobResults.value,
+    euDashboardMetric.value,
+  ),
+)
+
+const quartileOutlierResult = computed(() =>
+  computeQuartileOutliers(genderNormalizedForAnalysis.value, euDashboardMetric.value),
+)
+const quartileOutlierRows = computed(() => quartileOutlierResult.value.rows)
+const quartileOutlierTruncated = computed(() => quartileOutlierResult.value.truncated)
+const quartileOutlierTotal = computed(() => quartileOutlierResult.value.total)
+
+const quartilePeopleGroups = computed(() =>
+  assignSalaryQuartiles(genderNormalizedForAnalysis.value, euDashboardMetric.value),
+)
+
+const expandedQuartiles = ref(new Set())
+
+function toggleQuartile(quartile) {
+  const k = String(quartile)
+  if (expandedQuartiles.value.has(k)) expandedQuartiles.value.delete(k)
+  else expandedQuartiles.value.add(k)
+  expandedQuartiles.value = new Set(expandedQuartiles.value)
+}
+
+function isQuartileExpanded(quartile) {
+  return expandedQuartiles.value.has(String(quartile))
+}
+
+function quartilePeople(quartile) {
+  return quartilePeopleGroups.value.find((g) => g.quartile === quartile)?.people || []
+}
+
+const quartileExcludedEntries = computed(() => {
+  const cache = genderNormalizedCache.value
+  const out = []
+  for (const [key, text] of Object.entries(quartileOutlierJustifications.value)) {
+    const note = String(text || '').trim()
+    if (!note) continue
+    const idx = Number(key)
+    const person = cache.find((r) => r.index === idx)
+    if (person) out.push({ ...person, note })
+  }
+  return out.sort((a, b) => a.index - b.index)
+})
+
+function findJobGradingContextByIndex(index) {
+  for (const sub of jobFasce.value) {
+    for (const rb of sub.roles || []) {
+      const p = (rb.people || []).find((pp) => pp.index === index)
+      if (p) {
+        return { band: { level: rb.level, band: null }, hayBand: sub, roleBlock: rb, person: p }
+      }
+    }
+  }
+  return null
+}
+
+function openQuartileOutlierJustifyTab(row) {
+  if (!row) return
+  const key = String(row.index)
+  const ctx = findJobGradingContextByIndex(row.index)
+  const fullRow = genderNormalizedCache.value.find((r) => r.index === row.index)
+
+  if (ctx) {
+    openPersonJustify(ctx.person, ctx.roleBlock, ctx.band, ctx.hayBand)
+  } else {
+    justifyingPerson.value = {
+      key,
+      displayName: row.name && String(row.name).trim() ? String(row.name).trim() : `Dipendente #${key}`,
+      label: `Outlier quartile · #${key}`,
+      seniority: fullRow?.seniority || null,
+      seniorityYearsRaw: null,
+      fascAvgSeniorityYears: null,
+      seniorityPctVsFascia: null,
+      roleSeniority: fullRow?.roleSeniority || null,
+      roleSeniorityYearsRaw: null,
+      fascAvgRoleSeniorityYears: null,
+      roleSeniorityPctVsFascia: null,
+      performanceScore: personPerformanceScore(fullRow),
+      fascAvgPerformance: null,
+      performancePctVsFascia: null,
+      roleName: fullRow?.role != null && String(fullRow.role).trim() ? String(fullRow.role).trim() : 'N/D',
+      bandNum: '–',
+      levelLabel: fullRow?.level != null && String(fullRow.level).trim() ? String(fullRow.level).trim() : 'N/D',
+      fasciaId: `Q${row.quartile}`,
+      fasciaRange: row.reason || 'Outlier quartile',
+      baseSalary: null,
+      variableComponents: null,
+      totalSalary: row.salary,
+      gender: row.gender,
+      roleScoresBlock: null,
+      trWeightedScore: null,
+      trParametricScore100: null,
+      gapFasciaPct: null,
+      gapFasciaFormatted: '–',
+      avgFasciaSalary: null,
+      personDeviationFromFasciaPct: null,
+      avgSalaryMen: null,
+      avgSalaryWomen: null,
+      nMenFascia: 0,
+      nWomenFascia: 0,
+      justifySource: 'quartile_outlier',
+    }
+    resultsTabBeforeJustify.value = resultsTab.value
+    resultsTab.value = 'person_justify'
+    nextTick(() => {
+      mainWrapRef.value?.scrollTo({ top: 0, behavior: 'smooth' })
+      window.scrollTo({ top: 0, behavior: 'smooth' })
+    })
+  }
+
+  justifyText.value = quartileOutlierJustifications.value[key] || ''
+  if (justifyingPerson.value) {
+    justifyingPerson.value.justifySource = 'quartile_outlier'
+  }
+}
+
+function clearQuartileOutlierExclusion(index) {
+  const next = { ...quartileOutlierJustifications.value }
+  delete next[String(index)]
+  quartileOutlierJustifications.value = next
+}
+
+const BAND_JUSTIFY_REASONS = [
+  { id: 'seniority', label: 'Anzianità di servizio', icon: '⏳', desc: 'Differenza significativa nell\'anzianità media tra i generi nella band' },
+  { id: 'performance', label: 'Performance e Merito', icon: '🏆', desc: 'Differenze retributive legate a valutazioni di performance documentate' },
+  { id: 'market', label: 'Scarsità di Mercato', icon: '📈', desc: 'Market premium applicato per ruoli con alta domanda/bassa offerta' },
+  { id: 'training', label: 'Formazione d\'Eccellenza', icon: '🎓', desc: 'Possesso di certificazioni, master o percorsi formativi rilevanti' },
+  { id: 'flexibility', label: 'Flessibilità Oraria / Turnazione', icon: '🔄', desc: 'Indennità legate a turni notturni, festivi o condizioni speciali' },
+]
+
+function getOrCreateJustification(band) {
+  if (!bandGenderJustifications.value[band]) {
+    bandGenderJustifications.value = {
+      ...bandGenderJustifications.value,
+      [band]: { reasons: [], note: '', files: [] },
+    }
+  }
+  return bandGenderJustifications.value[band]
+}
+
+function toggleJustifyBand(band) {
+  if (expandedJustifyBand.value === band) {
+    expandedJustifyBand.value = null
+  } else {
+    getOrCreateJustification(band)
+    expandedJustifyBand.value = band
+  }
+}
+
+function toggleBandReason(band, reasonId) {
+  const j = getOrCreateJustification(band)
+  const idx = j.reasons.indexOf(reasonId)
+  if (idx >= 0) j.reasons.splice(idx, 1)
+  else j.reasons.push(reasonId)
+  bandGenderJustifications.value = { ...bandGenderJustifications.value }
+}
+
+function updateBandNote(band, text) {
+  const j = getOrCreateJustification(band)
+  j.note = text
+  bandGenderJustifications.value = { ...bandGenderJustifications.value }
+}
+
+function onBandFileUpload(band, event) {
+  const files = event.target.files
+  if (!files?.length) return
+  const j = getOrCreateJustification(band)
+  for (const f of files) {
+    j.files.push({ name: f.name, size: f.size, file: f })
+  }
+  bandGenderJustifications.value = { ...bandGenderJustifications.value }
+  event.target.value = ''
+}
+
+function removeBandFile(band, index) {
+  const j = getOrCreateJustification(band)
+  j.files.splice(index, 1)
+  bandGenderJustifications.value = { ...bandGenderJustifications.value }
+}
+
+function clearBandJustification(band) {
+  const copy = { ...bandGenderJustifications.value }
+  delete copy[band]
+  bandGenderJustifications.value = copy
+  if (expandedJustifyBand.value === band) expandedJustifyBand.value = null
+}
+
+function hasBandJustification(band) {
+  const j = bandGenderJustifications.value[band]
+  return j && (j.reasons.length > 0 || j.note || j.files.length > 0)
+}
+
+function bandJustifySummary(band) {
+  const j = bandGenderJustifications.value[band]
+  if (!j) return ''
+  const labels = j.reasons.map((id) => BAND_JUSTIFY_REASONS.find((r) => r.id === id)?.label || id)
+  const parts = []
+  if (labels.length) parts.push(labels.join(', '))
+  if (j.note) parts.push('+ nota')
+  if (j.files.length) parts.push(`${j.files.length} doc`)
+  return parts.join(' · ')
+}
+
+function formatFileSize(bytes) {
+  if (bytes < 1024) return bytes + ' B'
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB'
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB'
+}
+
+onMounted(async () => {
+  geminiApiUnreachable.value = false
+  try {
+    const res = await fetch('/api/gemini/status')
+    if (!res.ok) {
+      geminiApiUnreachable.value = true
+      geminiEnabled.value = false
+    } else {
+      const data = await res.json()
+      geminiEnabled.value = !!(data.aiEnabled ?? data.geminiEnabled)
+    }
+  } catch {
+    geminiApiUnreachable.value = true
+    geminiEnabled.value = false
+  }
+})
+
+</script>
+<template>
+  <div class="app-layout">
+    <aside class="side-nav" aria-label="Sezioni">
+      <div class="side-nav-brand">
+        <img class="side-nav-logo" src="/spark-logo.png" alt="Spark" />
+      </div>
+      <p class="side-nav-kicker">SEZIONI</p>
+      <nav class="side-nav-list">
+        <template v-for="item in sideMenu" :key="item.id">
+        <button
+          type="button"
+          class="side-nav-item"
+          :class="{ active: sideItemIsActive(item), open: item.children && sideExpanded[item.id] }"
+          @click="onSideItemClick(item)"
+        >
+          <span class="side-nav-icon" aria-hidden="true">
+            <svg v-if="item.icon === 'info'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+              <circle cx="12" cy="12" r="8.25"/>
+              <path d="M12 11.2v5" stroke-linecap="round"/>
+              <circle cx="12" cy="8.1" r="0.85" fill="currentColor" stroke="none"/>
+            </svg>
+            <svg v-else-if="item.icon === 'chart'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+              <rect x="4.2" y="12" width="3.4" height="7" rx="0.6"/>
+              <rect x="10.3" y="7.2" width="3.4" height="11.8" rx="0.6"/>
+              <rect x="16.4" y="4.2" width="3.4" height="14.8" rx="0.6"/>
+            </svg>
+            <svg v-else-if="item.icon === 'user'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+              <circle cx="12" cy="8.2" r="3.1"/>
+              <path d="M5.6 19.2c1.15-3.05 3.35-4.55 6.4-4.55s5.25 1.5 6.4 4.55" stroke-linecap="round"/>
+            </svg>
+            <svg v-else-if="item.icon === 'target'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+              <circle cx="12" cy="12" r="8"/>
+              <circle cx="12" cy="12" r="4.2"/>
+              <circle cx="12" cy="12" r="1.15" fill="currentColor" stroke="none"/>
+            </svg>
+            <svg v-else-if="item.icon === 'book-open'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+              <path d="M12 6.2C10.4 5 8.1 4.4 4.5 4.4V17.2c3.6 0 5.9.6 7.5 1.8" stroke-linejoin="round"/>
+              <path d="M12 6.2c1.6-1.2 3.9-1.8 7.5-1.8v12.8c-3.6 0-5.9.6-7.5 1.8" stroke-linejoin="round"/>
+            </svg>
+            <svg v-else-if="item.icon === 'eval'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+              <path d="M4.5 16.5 9 12l3 2.6 6.2-7.1" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M14.2 7.5H18.5V11.6" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            <svg v-else-if="item.icon === 'okr'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+              <path d="M4.5 17.5V12" stroke-linecap="round"/>
+              <path d="M9.5 17.5V9" stroke-linecap="round"/>
+              <path d="M14.5 17.5V6.5" stroke-linecap="round"/>
+              <path d="M19.5 17.5V4.5" stroke-linecap="round"/>
+              <path d="M4 19.2h16" stroke-linecap="round"/>
+            </svg>
+            <svg v-else-if="item.icon === 'clipboard'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+              <rect x="6.2" y="4.8" width="11.6" height="15" rx="1.8"/>
+              <path d="M9.2 4.6h5.6v2.1H9.2z" stroke-linejoin="round"/>
+              <path d="M9 11.2h6M9 14.2h6M9 17.2h3.6" stroke-linecap="round"/>
+            </svg>
+            <svg v-else-if="item.icon === 'book'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+              <path d="M6.2 5h10.2A1.6 1.6 0 0 1 18 6.6V19H8.4A2.2 2.2 0 0 0 6.2 21.2V5z" stroke-linejoin="round"/>
+              <path d="M6.2 5A2.2 2.2 0 0 0 4 7.2V18" stroke-linecap="round"/>
+            </svg>
+          </span>
+          <span class="side-nav-label">{{ item.label }}</span>
+          <svg v-if="item.expandable" class="side-nav-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+            <path d="M6.5 9.5 12 15l5.5-5.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+          <div v-if="item.children && sideExpanded[item.id]" class="side-nav-sub">
+            <button
+              v-for="child in item.children"
+              :key="child.id"
+              type="button"
+              class="side-nav-subitem"
+              :class="{ active: activeSideItem === child.id }"
+              @click="activeSideItem = child.id"
+            >
+              {{ child.label }}
+            </button>
+          </div>
+        </template>
+      </nav>
+    </aside>
+
+    <div class="app-main">
+    <template v-if="activeSideItem === 'compensation-transparency'">
+    <header class="tab-bar">
+      <nav class="tabs">
+        <button
+          v-for="s in sections"
+          :key="s.id"
+          class="tab"
+          :class="{ active: activeSection === s.id }"
+          @click="activeSection = s.id; if (s.id === 'analisi' && analisiStep === 'idle') analisiStep = 'upload'; if (s.id === 'storico' || s.id === 'insights') loadStorico()"
+        >
+          <span class="tab-icon">
+            <svg v-if="s.icon === 'table'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3h18v18H3zM3 9h18M3 15h18M9 3v18M15 3v18"/></svg>
+            <svg v-else-if="s.icon === 'history'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+            <svg v-else-if="s.icon === 'chart'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5M4 19h16"/><path d="M8 15v-3M12 15V8M16 15v-5"/></svg>
+          </span>
+          <span class="tab-label">{{ s.label }}</span>
+        </button>
+      </nav>
+      <button class="btn-primary tab-bar-action" @click="startNuovaAnalisi">
+        <span>NUOVA ANALISI</span>
+      </button>
+    </header>
+
+    <div ref="mainWrapRef" class="main-wrap">
+
+    <!-- Flusso unificato: Upload → Mapping → Risultati -->
+    <template v-if="showAnalisiFlow">
+      <!-- Step 1: Link Excel -->
+      <div v-if="analisiStep === 'upload'" class="analisi-content panel-card">
+        <h2 class="analisi-title">Collegamento al file Excel</h2>
+        <p class="analisi-desc">Incolla il link a un file Excel (.xlsx) in cloud oppure carica un file locale (.xlsx, .xls, .csv). L'app mapperà automaticamente le colonne per la valutazione dei lavori di pari valore (job grading).</p>
+        <div class="url-input-wrap">
+          <input v-model="excelUrl" type="url" class="url-input" placeholder="https://... file.xlsx" :disabled="uploadLoading || geminiLoading" @keydown.enter="onLoadFromUrl" />
+          <button type="button" class="btn-primary" :disabled="uploadLoading || geminiLoading || !excelUrl.trim()" @click="onLoadFromUrl">
+            <span v-if="uploadLoading">Scaricamento…</span>
+            <span v-else-if="geminiLoading">Riconoscimento colonne…</span>
+            <span v-else>Carica e mappa colonne</span>
+          </button>
+        </div>
+        <div class="upload-alt-divider"><span>oppure</span></div>
+        <div class="url-input-wrap">
+          <input
+            ref="excelFileInputRef"
+            type="file"
+            class="url-input"
+            accept=".xlsx,.xls,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,text/csv"
+            :disabled="uploadLoading || geminiLoading"
+            @change="onExcelFileChange"
+          />
+          <button type="button" class="btn-secondary" :disabled="uploadLoading || geminiLoading || !excelFile" @click="onLoadFromFile">
+            <span v-if="uploadLoading">Caricamento…</span>
+            <span v-else-if="geminiLoading">Riconoscimento colonne…</span>
+            <span v-else>Usa file selezionato</span>
+          </button>
+        </div>
+        <p v-if="excelFile" class="url-hint">File selezionato: <strong>{{ excelFile.name }}</strong></p>
+        <p class="api-key-warn">
+          Stato Claude: <strong>{{ geminiEnabled ? 'attivo' : 'non attivo' }}</strong>
+          <span v-if="geminiApiUnreachable" class="muted"> (API non raggiungibile in questo ambiente)</span>
+        </p>
+        <p class="url-hint">Puoi incollare un link Google Sheets: verrà convertito in download .xlsx.</p>
+        <p v-if="uploadError" class="upload-error">{{ uploadError }}</p>
+      </div>
+
+      <!-- Step 2: Mapping colonne unificato -->
+      <div v-else-if="analisiStep === 'mapping'" class="analisi-content">
+        <h2 class="analisi-title">Verifica assegnazione colonne</h2>
+        <p class="analisi-desc">
+          Associa ogni dato alla colonna corrispondente del file. I campi <strong>obbligatori</strong> sono necessari per avviare l'analisi;
+          quelli consigliati migliorano l'affidabilità del gap retributivo.
+        </p>
+        <p v-if="teaTracciatoActive" class="mapping-warn">
+          Tracciato TEA riconosciuto. Minimo, superminimi, scatti, forfait straordinari e altre voci fisse sono mensili: restano nel dettaglio e non si sommano alla RAL.
+          La RAL è annua. Nel confronto si normalizza solo sulla percentuale di part-time, non sulle date di assunzione o cessazione.
+          Il bonus erogato segue la stessa regola. MBO base 100 e premio di risultato base 100 sono obiettivi, non importi erogati.
+          Fringe benefit e welfare sono annui.
+        </p>
+
+        <div
+          v-for="section in mappingUiSections"
+          :key="section.id"
+          class="mapping-section"
+        >
+          <h3 class="mapping-section-title">{{ section.title }}</h3>
+          <div class="mapping-table">
+            <div class="mapping-row header">
+              <span>Dato</span>
+              <span>Colonna nel file</span>
+            </div>
+            <div
+              v-for="field in section.fields"
+              :key="field.role"
+              class="mapping-row"
+              :class="{
+                'mapping-row--required': field.badge === 'required',
+                'mapping-row--recommended': field.badge === 'recommended',
+                'mapping-row--unmapped-required': field.badge === 'required' && !isMappingFieldAssigned(field.role),
+                'mapping-row--unmapped-recommended': field.badge === 'recommended' && !isMappingFieldAssigned(field.role),
+              }"
+            >
+              <span class="mapping-field-label">
+                <span class="mapping-field-name">{{ field.label }}</span>
+                <span v-if="field.hint" class="mapping-hint">{{ field.hint }}</span>
+              </span>
+              <select v-model.number="columnMapping[field.role]" class="mapping-select" :disabled="analysisLoading">
+                <option :value="undefined">– Nessuna –</option>
+                <option v-for="(h, i) in excelHeaders" :key="i" :value="i">{{ h }}</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <p v-if="mappingRequiredMissing.length" class="mapping-error">
+          Per procedere mappa: <strong>{{ mappingRequiredMissing.join(', ') }}</strong>.
+        </p>
+        <p v-else-if="mappingRecommendedMissing.length" class="mapping-warn">
+          Consigliato mappare anche: {{ mappingRecommendedMissing.join(', ') }}.
+        </p>
+
+        <div class="settings-panel">
+          <h3 class="settings-title">Nome nello storico</h3>
+          <p class="settings-hint">Il nome identifica questo salvataggio. Se lo lasci vuoto, viene usato il nome del file.</p>
+          <label class="history-save-field">
+            <span class="gap-report-field-label">Nome del salvataggio</span>
+            <input
+              v-model="analysisSaveName"
+              type="text"
+              maxlength="120"
+              class="url-input history-save-name"
+              placeholder="Es. Organico marzo 2026"
+              :disabled="analysisLoading"
+            />
+          </label>
+        </div>
+
+        <div class="settings-panel">
+          <h3 class="settings-title">Metodo di analisi</h3>
+          <p class="settings-hint">Il job grading pesa tutti i ruoli insieme. Le fasce raccolgono i lavori con lo stesso punteggio, da qualunque livello CCNL. Il confronto per livello resta nel tab dedicato.</p>
+        </div>
+
+        <p v-if="geminiInfoNotice" class="upload-info">{{ geminiInfoNotice }}</p>
+        <p v-if="uploadError" class="upload-error">{{ uploadError }}</p>
+        <div class="mapping-actions">
+          <button class="btn-secondary" :disabled="analysisLoading" @click="goToUpload">Indietro</button>
+          <button class="btn-primary" :disabled="analysisLoading || !canConfirmMapping" @click="confirmMapping">
+            <span v-if="analysisLoading">Generazione analisi...</span>
+            <span v-else>Esegui analisi</span>
+          </button>
+        </div>
+        <div v-if="analysisLoading" class="analysis-loader">
+          <span class="spinner" aria-hidden="true"></span>
+          <span>Elaboro analisi...</span>
+        </div>
+      </div>
+
+      <!-- Step 3: Risultati con sub-tab -->
+      <div v-else-if="analisiStep === 'results'" class="analisi-content results">
+        <div class="results-head">
+          <h2 class="analisi-title">Risultati analisi</h2>
+          <div class="history-save-bar">
+            <label class="history-save-field history-save-field--inline">
+              <span class="sr-only">Nome del salvataggio</span>
+              <input
+                v-model="analysisSaveName"
+                type="text"
+                maxlength="120"
+                class="url-input history-save-name"
+                placeholder="Nome del salvataggio"
+                :disabled="historySaving"
+              />
+            </label>
+            <button type="button" class="btn-secondary" :disabled="historySaving" @click="persistCurrentAnalysis">
+              {{ historySaving ? 'Salvataggio…' : 'Salva nello storico' }}
+            </button>
+          </div>
+        </div>
+        <p v-if="saveStatus" :class="saveStatusIsError ? 'upload-error' : 'save-status'">{{ saveStatus }}</p>
+        <p v-if="uploadError" class="upload-error">{{ uploadError }}</p>
+
+        <div class="results-subtabs eu-results-tabs">
+          <button
+            type="button"
+            class="subtab"
+            :class="{ active: resultsTab === 'eu_dashboard' }"
+            @click="resultsTab = 'eu_dashboard'"
+          >
+            Dashboard trasparenza genere (UE)
+          </button>
+          <button
+            type="button"
+            class="subtab"
+            :class="{ active: resultsTab === 'ccnl_level' }"
+            :disabled="jobResults.length === 0"
+            @click="resultsTab = 'ccnl_level'"
+          >
+            Confronto per livello CCNL
+          </button>
+          <button
+            type="button"
+            class="subtab subtab--integrative"
+            :class="{ active: resultsTab === 'job_grading' }"
+            :disabled="jobResults.length === 0"
+            @click="resultsTab = 'job_grading'"
+          >
+            Analisi per fascia (integrativa)
+          </button>
+          <button
+            type="button"
+            class="subtab subtab--integrative"
+            :class="{ active: resultsTab === 'cost_center' }"
+            :disabled="!hasCostCenterData"
+            @click="resultsTab = 'cost_center'"
+          >
+            Analisi per centro di costo
+          </button>
+          <button
+            v-if="justifyingPerson != null"
+            type="button"
+            class="subtab"
+            :class="{ active: resultsTab === 'person_justify' }"
+            @click="resultsTab = 'person_justify'"
+          >
+            Giustificativo
+          </button>
+        </div>
+
+        <!-- Global Gender Pay Transparency Dashboard — Direttiva UE 2023/970 -->
+        <div v-show="resultsTab === 'eu_dashboard'" class="eu-dashboard-wrap">
+          <div v-if="genderNormalizedCache.length === 0" class="no-data-msg">
+            Per la <strong>Global Gender Pay Transparency Dashboard</strong> (Direttiva UE 2023/970) è necessario mappare la colonna <strong>Genere</strong> e avere dipendenti con valori M/F nel file.
+          </div>
+          <template v-else>
+            <div class="eu-dash-header">
+              <h3 class="eu-dash-title">Global Gender Pay Transparency Dashboard</h3>
+              <p class="eu-dash-sub">
+                Trasparenza retributiva di genere — riferimento <strong>Direttiva UE 2023/970</strong>.
+              </p>
+              <div class="eu-salary-toggle">
+                <span class="eu-salary-toggle-label">Metrica retributiva:</span>
+                <button
+                  v-for="opt in euDashboardMetricOptions"
+                  :key="'eu-m-' + opt.value"
+                  type="button"
+                  :class="['toggle-btn', { active: euDashboardMetric === opt.value }]"
+                  @click="euDashboardMetric = opt.value"
+                >{{ opt.label }}</button>
+              </div>
+              <p class="eu-fte-note muted">RAL e variabili annui normalizzati sul part-time, non sulle date. Le voci mensili non entrano nel totale.</p>
+            </div>
+
+            <p class="eu-legend-line">
+              <span class="eu-leg eu-leg-green">■</span> |gap| &lt; 4% &nbsp;
+              <span class="eu-leg eu-leg-yellow">■</span> 4%–5% &nbsp;
+              <span class="eu-leg eu-leg-red">■</span> &gt; 5% (oltre soglia indicativa)
+            </p>
+
+            <div class="eu-kpi-grid">
+              <div class="eu-kpi-card">
+                <div class="eu-kpi-label">Gender pay gap medio (azienda)</div>
+                <div class="eu-kpi-value" :class="euGapSeverityClass(euDashboard.gapMean)">{{ formatGapMforF(euDashboard.gapMean) }}</div>
+              </div>
+              <div class="eu-kpi-card">
+                <div class="eu-kpi-label">Gender pay gap mediano (azienda)</div>
+                <div class="eu-kpi-value" :class="euGapSeverityClass(euDashboard.gapMedian)">{{ formatGapMforF(euDashboard.gapMedian) }}</div>
+              </div>
+              <div class="eu-kpi-card eu-kpi-span">
+                <div class="eu-kpi-label">Dipendenti analizzati</div>
+                <div class="eu-kpi-value-inline">
+                  <strong>Uomini:</strong> {{ euDashboard.nMaschi }}
+                  &nbsp;·&nbsp;
+                  <strong>Donne:</strong> {{ euDashboard.nFemmine }}
+                  &nbsp;·&nbsp;
+                  <span class="muted">Totale M/F: {{ euDashboard.nTotaleAnalizzati }}</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="eu-kpi-grid" style="margin-top: 0.5rem;">
+              <div class="eu-kpi-card">
+                <div class="eu-kpi-label">Gap medio comp. variabile</div>
+                <div class="eu-kpi-value" :class="euGapSeverityClass(euDashboard.gapVarMean)">{{ euDashboard.gapVarMean != null ? formatGapMforF(euDashboard.gapVarMean) : 'n/d' }}</div>
+              </div>
+              <div class="eu-kpi-card">
+                <div class="eu-kpi-label">Gap mediano comp. variabile</div>
+                <div class="eu-kpi-value" :class="euGapSeverityClass(euDashboard.gapVarMedian)">{{ euDashboard.gapVarMedian != null ? formatGapMforF(euDashboard.gapVarMedian) : 'n/d' }}</div>
+              </div>
+              <div class="eu-kpi-card eu-kpi-span">
+                <div class="eu-kpi-label">Lavoratori con componenti variabili</div>
+                <div class="eu-kpi-value-inline">
+                  <strong>Uomini:</strong> {{ euDashboard.pctMenWithVar != null ? euDashboard.pctMenWithVar.toFixed(1) + '%' : 'n/d' }}
+                  &nbsp;·&nbsp;
+                  <strong>Donne:</strong> {{ euDashboard.pctWomenWithVar != null ? euDashboard.pctWomenWithVar.toFixed(1) + '%' : 'n/d' }}
+                </div>
+              </div>
+            </div>
+
+            <div class="eu-charts-row">
+              <div class="eu-panel">
+                <h4 class="eu-panel-title">Quartili retributivi</h4>
+                <p class="eu-panel-desc">
+                  Quattro gruppi uguali (dal 25% più basso al 25% più alto). Per ciascun quartile: <strong>media retributiva</strong> uomini vs donne
+                  ({{ euMetricLabel }}, normalizzato FTE). Le barre confrontano M e F <em>nello stesso quartile</em>.
+                  Clicca su un quartile per vedere l’elenco dipendenti.
+                </p>
+                <div class="eu-quartile-chart">
+                  <div
+                    v-for="q in euDashboard.quartiles"
+                    :key="q.quartile"
+                    class="eu-quartile-col"
+                    :class="{
+                      'eu-quartile-col--clickable': q.totale > 0,
+                      'eu-quartile-col--expanded': isQuartileExpanded(q.quartile),
+                    }"
+                    :role="q.totale > 0 ? 'button' : undefined"
+                    :tabindex="q.totale > 0 ? 0 : undefined"
+                    :title="q.totale > 0 ? 'Mostra elenco dipendenti' : undefined"
+                    @click="q.totale > 0 && toggleQuartile(q.quartile)"
+                    @keydown.enter.prevent="q.totale > 0 && toggleQuartile(q.quartile)"
+                    @keydown.space.prevent="q.totale > 0 && toggleQuartile(q.quartile)"
+                  >
+                    <div class="eu-q-label">{{ isQuartileExpanded(q.quartile) ? '▾' : '▸' }} Q{{ q.quartile }}</div>
+                    <div class="eu-q-chart-body">
+                      <div class="eu-q-pair">
+                        <div class="eu-q-bar-col">
+                          <div class="eu-q-bar-track">
+                            <div
+                              class="eu-q-bar eu-q-bar-m"
+                              :style="{ height: q.totale ? quartileBarHeightPx(q.barPctM) : '2px' }"
+                            ></div>
+                          </div>
+                        </div>
+                        <div class="eu-q-bar-col">
+                          <div class="eu-q-bar-track">
+                            <div
+                              class="eu-q-bar eu-q-bar-f"
+                              :style="{ height: q.totale ? quartileBarHeightPx(q.barPctF) : '2px' }"
+                            ></div>
+                          </div>
+                        </div>
+                      </div>
+                      <div class="eu-q-amounts">
+                        <div class="eu-q-amt">
+                          <span class="eu-q-amt-lbl">M</span>
+                          <span class="eu-q-amt-val">{{ q.avgMaschile != null ? formatNum(q.avgMaschile) + ' €' : 'n/d' }}</span>
+                        </div>
+                        <div class="eu-q-amt">
+                          <span class="eu-q-amt-lbl">F</span>
+                          <span class="eu-q-amt-val">{{ q.avgFemminile != null ? formatNum(q.avgFemminile) + ' €' : 'n/d' }}</span>
+                        </div>
+                      </div>
+                    </div>
+                    <div class="eu-q-deviation" :class="euGapSeverityClass(q.gapPct)">
+                      <span class="eu-q-deviation-label">Dev. media M vs F</span>
+                      <span class="eu-q-deviation-val">{{ q.gapPct == null ? 'n/d' : formatGapMforF(q.gapPct) }}</span>
+                      <span v-if="q.gapPct != null && Math.abs(q.gapPct) > EU_GAP_THRESHOLD_PCT" class="eu-q-deviation-flag">oltre {{ EU_GAP_THRESHOLD_PCT }}%</span>
+                    </div>
+                    <div class="eu-q-meta">n = {{ q.totale }} ({{ q.maschile }} M · {{ q.femminile }} F)</div>
+                  </div>
+                </div>
+                <div
+                  v-for="q in euDashboard.quartiles"
+                  v-show="isQuartileExpanded(q.quartile)"
+                  :key="'q-people-' + q.quartile"
+                  class="eu-quartile-people"
+                >
+                  <h5 class="eu-quartile-people-title">Dipendenti in Q{{ q.quartile }} ({{ quartilePeople(q.quartile).length }})</h5>
+                  <div class="eu-outlier-table-wrap">
+                    <table class="eu-outlier-table">
+                      <thead>
+                        <tr>
+                          <th>#</th>
+                          <th>Nome</th>
+                          <th>Genere</th>
+                          <th>Ruolo</th>
+                          <th>Livello</th>
+                          <th class="eu-outlier-num">{{ euMetricLabelShort }}</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr v-for="p in quartilePeople(q.quartile)" :key="'qp-' + q.quartile + '-' + p.index">
+                          <td>{{ p.index }}</td>
+                          <td>{{ p.name || '—' }}</td>
+                          <td><span :class="personGenderClass(p.gender)">{{ p.gender }}</span></td>
+                          <td>{{ p.role || '—' }}</td>
+                          <td>{{ p.level || '—' }}</td>
+                          <td class="eu-outlier-num">{{ formatNum(p.salary) }}</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+
+              <div class="eu-panel" style="margin-top: 1rem;">
+                <h4 class="eu-panel-title">Composizione quartili per genere</h4>
+                <p class="eu-panel-desc">Percentuale di uomini e donne in ciascun quartile, calcolata sulla popolazione totale di ciascun genere. Clicca su una riga per l’elenco dipendenti.</p>
+                <table class="eu-outlier-table">
+                  <thead>
+                    <tr>
+                      <th>Quartile</th>
+                      <th class="eu-outlier-num">Uomini nel Q</th>
+                      <th class="eu-outlier-num">% su tot. U</th>
+                      <th class="eu-outlier-num">Donne nel Q</th>
+                      <th class="eu-outlier-num">% su tot. D</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr
+                      v-for="q in euDashboard.quartiles"
+                      :key="'qc-' + q.quartile"
+                      class="eu-quartile-table-row"
+                      :class="{
+                        'eu-quartile-table-row--clickable': q.totale > 0,
+                        'eu-quartile-table-row--expanded': isQuartileExpanded(q.quartile),
+                      }"
+                      :role="q.totale > 0 ? 'button' : undefined"
+                      :tabindex="q.totale > 0 ? 0 : undefined"
+                      @click="q.totale > 0 && toggleQuartile(q.quartile)"
+                      @keydown.enter.prevent="q.totale > 0 && toggleQuartile(q.quartile)"
+                      @keydown.space.prevent="q.totale > 0 && toggleQuartile(q.quartile)"
+                    >
+                      <td>{{ isQuartileExpanded(q.quartile) ? '▾' : '▸' }} Q{{ q.quartile }}</td>
+                      <td class="eu-outlier-num">{{ q.maschile }}</td>
+                      <td class="eu-outlier-num">{{ q.pctOfTotalM != null ? q.pctOfTotalM.toFixed(1) + '%' : 'n/d' }}</td>
+                      <td class="eu-outlier-num">{{ q.femminile }}</td>
+                      <td class="eu-outlier-num">{{ q.pctOfTotalF != null ? q.pctOfTotalF.toFixed(1) + '%' : 'n/d' }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+
+              <div class="eu-panel">
+                <h4 class="eu-panel-title">Gap medio per livello CCNL</h4>
+                <p class="eu-panel-desc">Confronto media M vs F per livello ({{ euMetricLabel }}, FTE).</p>
+                <div class="eu-level-list">
+                  <div v-for="row in euDashboard.levelRows" :key="'lv-' + row.band + '-' + row.levelLabel" class="eu-level-row">
+                    <div class="eu-level-head">
+                      <span class="eu-level-name">{{ row.levelLabel }}</span>
+                      <span v-if="row.insufficientSample" class="eu-level-sample muted">{{ row.sampleMsg }}</span>
+                      <span v-else class="eu-level-gap" :class="euGapSeverityClass(row.gap)">{{ row.gap == null ? 'n/d' : formatGapMforF(row.gap) }}</span>
+                    </div>
+                    <div v-if="row.gap != null" class="eu-level-track">
+                      <div
+                        class="eu-level-fill"
+                        :class="euGapSeverityClass(row.gap)"
+                        :style="{ width: Math.min(100, Math.abs(row.gap) * 1.5) + '%' }"
+                      ></div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="eu-panel eu-outlier-panel">
+              <h4 class="eu-panel-title">Outlier retributivi (&gt; 5% dalla media)</h4>
+              <p class="eu-panel-desc">
+                Dipendenti la cui {{ euMetricLabel }}
+                si scosta di oltre il <strong>5%</strong> dalla media generale.
+                Per ogni outlier è indicato il quartile di appartenenza e lo scostamento percentuale.
+                Con un giustificativo testuale il dipendente viene <strong>escluso dall’analisi</strong> (KPI, quartili, gap per livello, fasce job grading, tab CCNL e centri di costo).
+              </p>
+              <p v-if="quartileOutlierTruncated" class="muted eu-outlier-cap-note">
+                Visualizzati al massimo 50 outlier: i {{ quartileOutlierRows.length }} con scostamento maggiore (su {{ quartileOutlierTotal }} rilevati).
+              </p>
+              <div v-if="quartileOutlierRows.length === 0" class="muted">
+                Nessun outlier rilevato (o dati insufficienti: servono almeno 2 persone con retribuzione valida).
+              </div>
+              <div v-else class="eu-outlier-table-wrap">
+                <table class="eu-outlier-table">
+                  <thead>
+                    <tr>
+                      <th>Q</th>
+                      <th>Nome</th>
+                      <th>Genere</th>
+                      <th class="eu-outlier-num">{{ euMetricLabelShort }}</th>
+                      <th class="eu-outlier-num">Scostamento</th>
+                      <th>Dettaglio</th>
+                      <th></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="row in quartileOutlierRows" :key="'o-' + row.index">
+                      <td>Q{{ row.quartile }}</td>
+                      <td>{{ row.name || '—' }}</td>
+                      <td><span :class="personGenderClass(row.gender)">{{ row.gender }}</span></td>
+                      <td class="eu-outlier-num">{{ formatNum(row.salary) }}</td>
+                      <td class="eu-outlier-num" :style="{ color: row.deviationPct > 0 ? 'var(--accent-green, #16a34a)' : 'var(--accent-red, #dc2626)' }">
+                        {{ row.deviationPct > 0 ? '+' : '' }}{{ row.deviationPct.toFixed(1) }}%
+                      </td>
+                      <td class="eu-outlier-reason">{{ row.reason }}</td>
+                      <td>
+                        <button type="button" class="btn-eu-outlier" @click="openQuartileOutlierJustifyTab(row)">Giustificativo</button>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+
+              <div v-if="quartileExcludedEntries.length" class="eu-outlier-excluded">
+                <h5 class="eu-outlier-excluded-title">Esclusi dall’analisi</h5>
+                <ul class="eu-outlier-excluded-list">
+                  <li v-for="ex in quartileExcludedEntries" :key="'ex-' + ex.index" class="eu-outlier-excluded-item">
+                    <div class="eu-outlier-ex-main">
+                      <span class="eu-outlier-ex-name">{{ ex.name || '—' }}</span>
+                      <span class="muted">#{{ ex.index }}</span>
+                    </div>
+                    <p class="eu-outlier-ex-note">{{ ex.note }}</p>
+                    <button type="button" class="btn-eu-outlier btn-eu-outlier-ghost" @click="clearQuartileOutlierExclusion(ex.index)">Ripristina in analisi</button>
+                  </li>
+                </ul>
+              </div>
+            </div>
+
+            <div class="eu-panel eu-alert-panel">
+              <h4 class="eu-panel-title">Top 3 criticità (fasce / cluster)</h4>
+              <ul v-if="euDashboard.criticalAlerts.length" class="eu-alert-list">
+                <li v-for="(a, idx) in euDashboard.criticalAlerts" :key="idx" class="eu-alert-item">
+                  <strong>{{ a.fasciaId }}</strong> ({{ a.fasciaLabel }}<template v-if="a.levelLabel">, livelli {{ a.levelLabel }}</template>):
+                  <span class="gap-alert">{{ formatGapMforF(a.gap) }}</span>
+                </li>
+              </ul>
+              <p v-else class="muted">Nessuna fascia con |gap| &gt; 5% tra quelle confrontabili, oppure dati insufficienti.</p>
+            </div>
+
+            <div class="eu-panel gap-report-export eu-panel--page-footer">
+              <h4 class="eu-panel-title">Report analisi divario retributivo (PDF)</h4>
+              <p class="eu-panel-desc muted">
+                Documento di supporto alla reportistica e alla documentazione interna.
+                Riflette metrica e filtri attivi in questa dashboard.
+              </p>
+              <div class="gap-report-export-fields">
+                <label class="gap-report-field">
+                  <span class="gap-report-field-label">Ragione sociale</span>
+                  <input v-model="reportCompanyName" type="text" class="gap-report-input" placeholder="Es. Acme S.p.A." />
+                </label>
+                <label class="gap-report-field">
+                  <span class="gap-report-field-label">Periodo di riferimento</span>
+                  <input v-model="reportReferencePeriod" type="text" class="gap-report-input" placeholder="Es. Anno 2025" />
+                </label>
+              </div>
+              <div class="gap-report-export-options">
+                <label class="gap-report-check">
+                  <input v-model="reportIncludeFascia" type="checkbox" />
+                  Includi analisi per fascia di grading (integrativa, non normativa)
+                </label>
+                <label v-if="hasCostCenterData" class="gap-report-check">
+                  <input v-model="reportIncludeCostCenter" type="checkbox" />
+                  Includi analisi per centro di costo (integrativa, non normativa)
+                </label>
+              </div>
+              <div class="gap-report-export-actions">
+                <button
+                  type="button"
+                  class="btn-primary"
+                  :disabled="gapReportExportLoading"
+                  @click="exportGapReportPdf"
+                >
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16" style="vertical-align: -3px; margin-right: 0.35rem;" aria-hidden="true"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6M12 18v-6M9 15l3 3 3-3"/></svg>
+                  {{ gapReportExportLoading ? 'Generazione in corso…' : 'Scarica report PDF' }}
+                </button>
+                <span v-if="geminiApiUnreachable" class="muted gap-report-api-hint">Richiede server API (vercel dev o deploy).</span>
+              </div>
+            </div>
+
+          </template>
+        </div>
+
+        <!-- Confronto per livello CCNL (reporting normativo) -->
+        <div v-show="resultsTab === 'ccnl_level'" class="ccnl-level-wrap">
+          <template v-if="jobResults.length > 0">
+            <div class="ccnl-level-head">
+              <h3 class="ccnl-level-title">Confronto retributivo per livello CCNL</h3>
+              <p class="ccnl-level-desc muted">
+                Persone raggruppate per <strong>CCNL</strong> (contratto collettivo); in ciascun CCNL il <strong>GPG</strong> è calcolato per livello di inquadramento come
+                <em>(media oraria uomini − media oraria donne) / media oraria uomini × 100</em>
+                ({{ euMetricLabel }}, normalizzato FTE).
+              </p>
+              <div class="eu-salary-toggle">
+                <span class="eu-salary-toggle-label">Metrica retributiva:</span>
+                <button
+                  v-for="opt in euDashboardMetricOptions"
+                  :key="'eu-m-' + opt.value"
+                  type="button"
+                  :class="['toggle-btn', { active: euDashboardMetric === opt.value }]"
+                  @click="euDashboardMetric = opt.value"
+                >{{ opt.label }}</button>
+              </div>
+              <p class="eu-fte-note muted">RAL e variabili annui normalizzati sul part-time, non sulle date. Le voci mensili non entrano nel totale.</p>
+            </div>
+
+            <div class="job-table ccnl-level-table">
+              <div class="job-row header ccnl-level-row">
+                <span v-if="hasMultipleCcnls">CCNL / Livello</span>
+                <span v-else>Livello CCNL</span>
+                <span>N tot.</span>
+                <span>N uomini</span>
+                <span>N donne</span>
+                <span>Media oraria M</span>
+                <span>Media oraria F</span>
+                <span>GPG</span>
+                <span>GPG mediano</span>
+                <span>Stato</span>
+              </div>
+              <template v-for="group in ccnlGroups" :key="'ccnl-g-' + group.ccnlKey">
+                <div
+                  v-if="hasMultipleCcnls"
+                  class="ccnl-contract-row clickable"
+                  role="button"
+                  tabindex="0"
+                  @click="toggleCcnlContract(group.ccnlKey)"
+                  @keydown.enter.prevent="toggleCcnlContract(group.ccnlKey)"
+                >
+                  <span class="ccnl-contract-label">
+                    <strong>{{ isCcnlContractExpanded(group.ccnlKey) ? '▾' : '▸' }} {{ group.ccnlLabel }}</strong>
+                    <span class="muted ccnl-contract-meta">{{ group.nTotal }} dip. · {{ group.nLevels }} livelli</span>
+                  </span>
+                </div>
+                <template v-if="!hasMultipleCcnls || isCcnlContractExpanded(group.ccnlKey)">
+                  <template v-for="row in group.levels" :key="'ccnl-' + group.ccnlKey + '-' + row.levelKey">
+                    <div
+                      class="job-row ccnl-level-row clickable"
+                      :class="{
+                        'ccnl-level-row--insufficient': row.insufficientSample,
+                        'ccnl-level-row--nested': hasMultipleCcnls,
+                      }"
+                      @click="toggleCcnlLevel(ccnlLevelCompositeKey(group, row))"
+                    >
+                      <span class="ccnl-level-label">
+                        <strong>{{ isCcnlLevelExpanded(ccnlLevelCompositeKey(group, row)) ? '▾' : '▸' }} {{ row.levelLabel }}</strong>
+                        <svg
+                          v-if="ccnlLevelHasActionableGap(row)"
+                          class="hay-band-alert-icon"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="2"
+                          width="14"
+                          height="14"
+                          title="Gap M/F oltre soglia nel livello"
+                        >
+                          <path d="M12 3l10 18H2L12 3z" />
+                          <path d="M12 9v5" />
+                          <circle cx="12" cy="17" r="1" fill="currentColor" stroke="none" />
+                        </svg>
+                      </span>
+                      <span>{{ row.nTotal }}</span>
+                      <span>{{ row.nM }}</span>
+                      <span>{{ row.nF }}</span>
+                      <span>{{ row.avgM != null ? formatNum(row.avgM) : '–' }}</span>
+                      <span>{{ row.avgF != null ? formatNum(row.avgF) : '–' }}</span>
+                      <span>
+                        <span
+                          v-if="row.insufficientSample"
+                          class="ccnl-gap-na muted"
+                          :title="row.sampleMsg"
+                        >n/d</span>
+                        <span
+                          v-else-if="row.gapMean != null"
+                          class="hay-band-gap-pill"
+                          :class="[ccnlLevelGapStatusClass(row), { 'gap-alert': ccnlLevelHasActionableGap(row) }]"
+                        >{{ formatGapMforF(row.gapMean, row.hasJustification) }}</span>
+                        <span v-else class="muted">–</span>
+                      </span>
+                      <span>
+                        <span v-if="row.insufficientSample" class="ccnl-gap-na muted">n/d</span>
+                        <span v-else-if="row.gapMedian != null">{{ formatGapMforF(row.gapMedian) }}</span>
+                        <span v-else class="muted">–</span>
+                      </span>
+                      <span>
+                        <span
+                          v-if="!row.insufficientSample"
+                          class="ccnl-status-badge"
+                          :class="ccnlLevelGapStatusClass(row)"
+                        >{{ row.status === 'green' ? 'OK' : row.status === 'yellow' ? 'Documentato' : row.status === 'red' ? 'Da correggere' : '–' }}</span>
+                        <span v-else class="muted">–</span>
+                      </span>
+                    </div>
+                    <div
+                      v-if="isCcnlLevelExpanded(ccnlLevelCompositeKey(group, row))"
+                      class="people-detail ccnl-level-detail"
+                      :class="{ 'ccnl-level-detail--nested': hasMultipleCcnls }"
+                    >
+                      <p v-if="row.insufficientSample" class="muted ccnl-sample-note">{{ row.sampleMsg }}</p>
+                      <div class="people-header ccnl-person-header">
+                        <span>#</span>
+                        <span>Persona</span>
+                        <span>Genere</span>
+                        <span>Ruolo</span>
+                        <span class="hay-person-deviation-head" title="Scostamento vs media oraria uomini nel livello CCNL (stesso denominatore del GPG)">Scost. vs media M</span>
+                        <span title="Retribuzione oraria ({{ euMetricLabel }})">Oraria</span>
+                        <span>Giustificativo</span>
+                      </div>
+                      <div
+                        v-for="p in row.people.filter((x) => x.gender === 'M' || x.gender === 'F')"
+                        :key="'ccnl-p-' + group.ccnlKey + '-' + row.levelKey + '-' + p.index"
+                        class="people-row ccnl-person-row"
+                      >
+                        <span>{{ p.index }}</span>
+                        <span>{{ p.name || '–' }}</span>
+                        <span><span :class="personGenderClass(p.gender)">{{ p.gender }}</span></span>
+                        <span>{{ p.role || '–' }}</span>
+                        <span class="hay-person-deviation-cell">{{ formatDeviationVsGenderGroupMean(p) }}</span>
+                        <span>{{ p.comparisonSalary != null ? formatNum(p.comparisonSalary) : '–' }}</span>
+                        <span class="hay-person-justify-cell">
+                          <button
+                            type="button"
+                            class="btn-justify-person"
+                            :class="{ 'has-note': personJustifications[String(p.index)] }"
+                            title="Apri o modifica il giustificativo (gap M/F nel livello CCNL)"
+                            @click.stop="openCcnlPersonJustify(p, { ...row, ccnlKey: group.ccnlKey, ccnlLabel: group.ccnlLabel, compositeKey: ccnlLevelCompositeKey(group, row) })"
+                          >
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14" aria-hidden="true"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg>
+                            + Giustificativo
+                          </button>
+                        </span>
+                      </div>
+                    </div>
+                  </template>
+                </template>
+              </template>
+            </div>
+          </template>
+          <p v-else class="no-data-msg">Nessun livello CCNL disponibile. Verifica il mapping del file.</p>
+        </div>
+
+        <div v-show="resultsTab === 'job_grading'">
+          <template v-if="jobResults.length > 0">
+          <div class="job-grading-tab-head">
+            <button type="button" class="btn-jg-criteria" @click="jobGradingCriteriaModalOpen = true">Info analisi</button>
+          </div>
+
+          <div class="band-section">
+            <h3 class="band-title">Fasce di job grading</h3>
+            <p class="muted band-summary">Pesatura unica su tutta la popolazione. Nella stessa fascia ci sono ruoli di livelli CCNL diversi, se il punteggio pesato coincide.</p>
+            <div class="job-table" v-if="jobFasce.length">
+              <div class="job-row header hay-row">
+                <span>Fascia</span><span title="Fascia di punteggio parametrico (scala /100)">Range /100</span><span>N uomini</span><span>N donne</span><span>N ruoli</span><span>Media retrib. M</span><span>Media retrib. F</span>
+              </div>
+              <template v-for="sub in jobFasce" :key="sub.label">
+                <div
+                  class="job-row hay-row clickable"
+                  @click="toggleHayBand('tutti', sub.label, sub)"
+                >
+                  <span class="hay-band-label">
+                    <strong>{{ isHayBandExpanded('tutti', sub.label) ? '▾' : '▸' }} {{ sub.id }}</strong>
+                    <svg
+                      v-if="hasHayBandDisparity(sub)"
+                      class="hay-band-alert-icon"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2"
+                      width="14"
+                      height="14"
+                      title="Presenza di disparita retributive nella fascia"
+                    >
+                      <path d="M12 3l10 18H2L12 3z" />
+                      <path d="M12 9v5" />
+                      <circle cx="12" cy="17" r="1" fill="currentColor" stroke="none" />
+                    </svg>
+                  </span>
+                  <span>
+                    {{ sub.label }}
+                    <span v-if="hayBandAdjustedGapPct(sub) != null" class="hay-band-gap-pill" :class="[hayBandGapStatusClass(sub), { 'gap-alert': hasHayBandDisparity(sub) }]">
+                      {{ formatGapMforF(hayBandAdjustedGapPct(sub), hayBandHasJustifications(sub)) }}
+                    </span>
+                  </span>
+                  <span>{{ sub.nMen ?? 0 }}</span>
+                  <span>{{ sub.nWomen ?? 0 }}</span>
+                  <span>{{ sub.nRoles }}</span>
+                  <span>{{ formatHayBandAvgMen(sub) }}</span>
+                  <span>{{ formatHayBandAvgWomen(sub) }}</span>
+                </div>
+                <div
+                  v-if="isHayBandExpanded('tutti', sub.label)"
+                  class="people-detail hay-fascia-detail"
+                >
+                  <div class="people-header hay-role-header jg-tr-score-grid">
+                    <span><svg class="inline-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13"><path d="M3 7h18"/><path d="M6 7V5a2 2 0 012-2h8a2 2 0 012 2v2"/><rect x="3" y="7" width="18" height="13" rx="2"/></svg> Ruolo</span>
+                    <span title="Livello di inquadramento CCNL del ruolo. Non separa la fascia.">Livello</span>
+                    <span
+                      v-for="area in TRANSPARENCY_MACRO_AREAS"
+                      :key="'h-' + area.id"
+                      class="jg-tr-col-head jg-tr-col-area"
+                      :title="area.label + ' — punti parametrici (0–100) nell’area; peso area sul totale: ' + area.weightPct + '%'"
+                    >{{ area.label }}</span>
+                    <span class="jg-tr-col-head jg-tr-col-head-punteggio" title="Punteggio parametrico 0–100: Σ (% peso × punteggio / 100) su tutti i fattori">Punteggio</span>
+                    <span class="jg-tr-col-head jg-tr-col-head-detail" title="Apri la scheda con macro-aree, fattori e punteggi 0–100">Dettaglio</span>
+                    <span>N</span>
+                    <span>Media retrib.</span>
+                  </div>
+                  <template v-for="rb in sub.roles" :key="`${rb.level}-${sub.label}-${rb.role}`">
+                    <div
+                      class="people-row hay-role-row jg-tr-score-grid clickable"
+                      @click="toggleRoleDetail(rb.level, sub.label, rb.role)"
+                    >
+                      <span class="role-cell-main">
+                        <span><svg class="inline-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13"><path d="M3 7h18"/><path d="M6 7V5a2 2 0 012-2h8a2 2 0 012 2v2"/><rect x="3" y="7" width="18" height="13" rx="2"/></svg>{{ isRoleDetailExpanded(rb.level, sub.label, rb.role) ? '▾' : '▸' }} {{ rb.role }}</span>
+                      </span>
+                      <span>{{ rb.level || '–' }}</span>
+                      <span
+                        v-for="area in TRANSPARENCY_MACRO_AREAS"
+                        :key="rb.role + area.id"
+                        class="jg-tr-score-cell"
+                        :title="macroAreaParametricTooltip(rb, area)"
+                      >{{ formatMacroAreaScore(rb, area) }}</span>
+                      <span class="jg-tr-score-cell jg-tr-p jg-tr-p-100">
+                        <template v-if="rb.trParametricScore100 != null">
+                          {{ formatNum(rb.trParametricScore100) }}<span class="muted jg-tr-p100-suffix">/100</span>
+                        </template>
+                        <template v-else>–</template>
+                      </span>
+                      <span class="jg-tr-detail-cell">
+                        <button
+                          type="button"
+                          class="btn-jg-role-valuation"
+                          title="Apri la tabella con macro-aree, fattori e punteggi"
+                          @click.stop="openRoleValuationModal(rb.level, sub.label, rb.role)"
+                        >
+                          Dettaglio valutazione
+                        </button>
+                      </span>
+                      <span>{{ rb.n }}</span>
+                      <span>{{ formatNum(rb.avgTotalSalary) }}</span>
+                    </div>
+                    <div
+                      v-if="isRoleDetailExpanded(rb.level, sub.label, rb.role)"
+                      class="jg-role-expand-block"
+                    >
+                      <div class="people-detail hay-person-detail jg-role-persons-after-table">
+                      <div class="people-header hay-person-header">
+                        <span>#</span><span><svg class="inline-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13"><circle cx="12" cy="7" r="4"/><path d="M5.5 21a6.5 6.5 0 0113 0"/></svg> Persona</span><span class="hay-person-deviation-head" title="Scostamento % retribuzione totale rispetto alla media della fascia">Scost. vs media fascia</span><span>Retrib. base</span><span>Comp. variabile</span>                        <span>Retrib. totale</span><span>Giustificativo</span>
+                      </div>
+                      <div
+                        v-for="p in rb.people"
+                        :key="`${rb.level}-${sub.label}-${rb.role}-${p.index}`"
+                        class="people-row hay-person-row"
+                      >
+                        <span>{{ p.index }}</span>
+                        <span>
+                          <svg
+                            v-if="p.gender === 'M'"
+                            class="inline-icon"
+                            :class="personGenderClass(p.gender)"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="2"
+                            width="13"
+                            height="13"
+                          ><circle cx="9" cy="15" r="5"/><path d="M13 11l7-7"/><path d="M15 4h5v5"/></svg>
+                          <svg
+                            v-else-if="p.gender === 'F'"
+                            class="inline-icon"
+                            :class="personGenderClass(p.gender)"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="2"
+                            width="13"
+                            height="13"
+                          ><circle cx="12" cy="9" r="5"/><path d="M12 14v7"/><path d="M9 18h6"/></svg>
+                          <svg
+                            v-else
+                            class="inline-icon gender-unknown"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="2"
+                            width="13"
+                            height="13"
+                          ><circle cx="12" cy="12" r="9"/><path d="M9 9h.01"/><path d="M15 9h.01"/><path d="M8 15c1.2 1.2 2.6 1.8 4 1.8s2.8-.6 4-1.8"/></svg>
+                          {{ p.name || '–' }}
+                        </span>
+                        <span class="hay-person-deviation-cell" title="Retribuzione totale vs media aritmetica della fascia (stesso punteggio pesato)">{{ formatDeviationVsBandMean(p) }}</span>
+                        <span>{{ formatNum(p.baseSalary) }}</span>
+                        <span>{{ formatNum(p.variableComponents) }}</span>
+                        <span>{{ formatNum(p.totalSalary) }}</span>
+                        <span class="hay-person-justify-cell">
+                          <button
+                            type="button"
+                            class="btn-justify-person"
+                            :class="{ 'has-note': personJustifications[String(p.index)] }"
+                            title="Apri o modifica il giustificativo (gap M/F nella fascia)"
+                            @click.stop="openPersonJustify(p, rb, { level: rb.level }, sub)"
+                          >
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14" aria-hidden="true"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg>
+                            + Giustificativo
+                          </button>
+                        </span>
+                      </div>
+                      </div>
+                    </div>
+                  </template>
+                </div>
+              </template>
+            </div>
+          </div>
+          </template>
+          <div v-else class="no-data-msg">
+            Dati job grading non disponibili. Verifica il mapping e riesegui l'analisi.
+          </div>
+        </div>
+
+        <!-- Analisi per centro di costo (gestionale, non normativa) -->
+        <div v-show="resultsTab === 'cost_center'" class="cost-center-wrap">
+          <template v-if="hasCostCenterData">
+            <div class="cost-center-head">
+              <h3 class="cost-center-title">Analisi per centro di costo</h3>
+              <p class="cost-center-sub muted">
+                <strong>Lettura organizzativa interna</strong> — non è reporting normativo.
+                Utile per individuare dove intervenire.
+              </p>
+              <div class="eu-salary-toggle">
+                <span class="eu-salary-toggle-label">Metrica retributiva:</span>
+                <button
+                  v-for="opt in euDashboardMetricOptions"
+                  :key="'eu-m-' + opt.value"
+                  type="button"
+                  :class="['toggle-btn', { active: euDashboardMetric === opt.value }]"
+                  @click="euDashboardMetric = opt.value"
+                >{{ opt.label }}</button>
+              </div>
+              <p class="eu-fte-note muted">RAL e variabili annui normalizzati sul part-time, non sulle date. Le voci mensili non entrano nel totale.</p>
+            </div>
+
+            <div v-if="costCenterGapHotspots.length" class="eu-panel cost-center-hotspots">
+              <h4 class="eu-panel-title">Dove si concentra il gap</h4>
+              <p class="eu-panel-desc">
+                Centri di costo con campione sufficiente e gap oltre soglia, ordinati per |gap| decrescente.
+                Il peso indica la quota di dipendenti sul totale analizzato (proxy di rilevanza organizzativa).
+              </p>
+              <ul class="cost-center-hotspot-list">
+                <li
+                  v-for="h in costCenterGapHotspots"
+                  :key="'hot-' + h.groupKey"
+                  class="cost-center-hotspot-item"
+                  :class="groupGapStatusClass(h)"
+                >
+                  <span class="cost-center-hotspot-rank">#{{ h.rank }}</span>
+                  <span class="cost-center-hotspot-name"><strong>{{ h.groupLabel }}</strong></span>
+                  <span class="cost-center-hotspot-gap gap-alert">{{ formatGapMforF(h.gapMean, h.hasJustification) }}</span>
+                  <span class="cost-center-hotspot-weight muted">Peso: {{ h.headcountWeightPct.toFixed(1) }}% (N={{ h.nTotal }})</span>
+                </li>
+              </ul>
+            </div>
+            <p v-else class="muted cost-center-hotspots-empty">Nessun centro di costo con gap oltre soglia e campione sufficiente.</p>
+
+            <div class="job-table ccnl-level-table cost-center-table">
+              <div class="job-row header ccnl-level-row">
+                <span>Centro di costo</span>
+                <span>N tot.</span>
+                <span>N uomini</span>
+                <span>N donne</span>
+                <span>Media M</span>
+                <span>Media F</span>
+                <span>Gap medio</span>
+                <span>Gap mediano</span>
+                <span>Stato</span>
+              </div>
+              <template v-for="row in costCenterRows" :key="'cdc-' + row.costCenterKey">
+                <div
+                  class="job-row ccnl-level-row clickable"
+                  :class="{ 'ccnl-level-row--insufficient': row.insufficientSample }"
+                  @click="toggleCostCenter(row.costCenterKey)"
+                >
+                  <span class="ccnl-level-label">
+                    <strong>{{ isCostCenterExpanded(row.costCenterKey) ? '▾' : '▸' }} {{ row.costCenterLabel }}</strong>
+                    <svg
+                      v-if="groupHasActionableGap(row)"
+                      class="hay-band-alert-icon"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2"
+                      width="14"
+                      height="14"
+                      title="Gap M/F oltre soglia nel centro di costo"
+                    >
+                      <path d="M12 3l10 18H2L12 3z" />
+                      <path d="M12 9v5" />
+                      <circle cx="12" cy="17" r="1" fill="currentColor" stroke="none" />
+                    </svg>
+                  </span>
+                  <span>{{ row.nTotal }}</span>
+                  <span>{{ row.nM }}</span>
+                  <span>{{ row.nF }}</span>
+                  <span>{{ row.avgM != null ? formatNum(row.avgM) : '–' }}</span>
+                  <span>{{ row.avgF != null ? formatNum(row.avgF) : '–' }}</span>
+                  <span>
+                    <span v-if="row.insufficientSample" class="ccnl-gap-na muted" :title="row.sampleMsg">n/d</span>
+                    <span
+                      v-else-if="row.gapMean != null"
+                      class="hay-band-gap-pill"
+                      :class="[groupGapStatusClass(row), { 'gap-alert': groupHasActionableGap(row) }]"
+                    >{{ formatGapMforF(row.gapMean, row.hasJustification) }}</span>
+                    <span v-else class="muted">–</span>
+                  </span>
+                  <span>
+                    <span v-if="row.insufficientSample" class="ccnl-gap-na muted">n/d</span>
+                    <span v-else-if="row.gapMedian != null">{{ formatGapMforF(row.gapMedian) }}</span>
+                    <span v-else class="muted">–</span>
+                  </span>
+                  <span>
+                    <span
+                      v-if="!row.insufficientSample"
+                      class="ccnl-status-badge"
+                      :class="groupGapStatusClass(row)"
+                    >{{
+                      row.status === 'green' ? 'OK' : row.status === 'yellow' ? 'Da verificare' : row.status === 'red' ? 'Da correggere' : '–'
+                    }}</span>
+                    <span v-else class="muted">–</span>
+                  </span>
+                </div>
+                <div v-if="isCostCenterExpanded(row.costCenterKey)" class="people-detail ccnl-level-detail cost-center-detail">
+                  <p v-if="row.insufficientSample" class="muted ccnl-sample-note">{{ row.sampleMsg }}</p>
+                  <div class="people-header ccnl-person-header cost-center-person-header">
+                    <span>#</span>
+                    <span>Persona</span>
+                    <span>Genere</span>
+                    <span>Ruolo</span>
+                    <span>Livello CCNL</span>
+                    <span class="hay-person-deviation-head" title="Scostamento vs media oraria uomini nel centro di costo (stesso denominatore del GPG)">Scost. vs media M</span>
+                    <span>{{ euMetricLabelShort }}</span>
+                    <span>Giustificativo</span>
+                  </div>
+                  <div
+                    v-for="p in row.people.filter((x) => x.gender === 'M' || x.gender === 'F')"
+                    :key="'cdc-p-' + row.costCenterKey + '-' + p.index"
+                    class="people-row ccnl-person-row cost-center-person-row"
+                  >
+                    <span>{{ p.index }}</span>
+                    <span>{{ p.name || '–' }}</span>
+                    <span><span :class="personGenderClass(p.gender)">{{ p.gender }}</span></span>
+                    <span>{{ p.role || '–' }}</span>
+                    <span>{{ p.level || '–' }}</span>
+                    <span class="hay-person-deviation-cell">{{ formatDeviationVsGenderGroupMean(p) }}</span>
+                    <span>{{ p.comparisonSalary != null ? formatNum(p.comparisonSalary) : '–' }}</span>
+                    <span class="hay-person-justify-cell">
+                      <button
+                        type="button"
+                        class="btn-justify-person"
+                        :class="{ 'has-note': personJustifications[String(p.index)] }"
+                        title="Apri o modifica il giustificativo (gap M/F nel centro di costo)"
+                        @click.stop="openCostCenterPersonJustify(p, row)"
+                      >
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14" aria-hidden="true"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg>
+                        + Giustificativo
+                      </button>
+                    </span>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </template>
+          <p v-else class="no-data-msg">
+            Mappa la colonna <strong>Categoria / centro di costo</strong> nel file Excel per abilitare questa analisi organizzativa.
+          </p>
+        </div>
+
+        <!-- Tab: inserisci giustificativo (ex popup) -->
+        <div
+          v-show="resultsTab === 'person_justify' && justifyingPerson"
+          class="person-justify-tab-panel"
+        >
+          <template v-if="justifyingPerson">
+            <h2 class="person-justify-tab-title">
+              Inserisci giustificativo per {{ justifyingPerson.displayName }}
+            </h2>
+            <p class="person-justify-tab-lead">
+              <template v-if="justifyingPerson.justifySource === 'ccnl_level'">
+                <strong>Ruolo:</strong> {{ justifyingPerson.roleName }}
+                · <strong>CCNL</strong> {{ justifyingPerson.ccnlLabel }}
+                · <strong>Livello</strong> {{ justifyingPerson.levelLabel }}
+              </template>
+              <template v-else-if="justifyingPerson.justifySource === 'cost_center'">
+                <strong>Ruolo:</strong> {{ justifyingPerson.roleName }}
+                · <strong>Livello CCNL</strong> {{ justifyingPerson.levelLabel }}
+                · <strong>Centro di costo</strong> {{ justifyingPerson.costCenterLabel }}
+              </template>
+              <template v-else>
+                <strong>Ruolo:</strong> {{ justifyingPerson.roleName }}
+                · <strong>Livello CCNL</strong> {{ justifyingPerson.levelLabel }}
+                · <strong>{{ justifyingPerson.fasciaId }}</strong> — range /100 {{ justifyingPerson.fasciaRange }}
+              </template>
+            </p>
+
+            <div class="person-justify-summary-grid">
+              <div class="person-justify-summary-card">
+                <h4 class="person-justify-summary-title">Dati retributivi</h4>
+                <ul class="person-justify-summary-list">
+                  <li><strong>{{ justifyingTeaPay ? 'RAL annua' : 'Retribuzione base' }}:</strong> {{ formatNum(justifyingPerson.baseSalary) }}</li>
+                  <li v-if="justifyingTeaPay"><strong>RAL FTE (solo part-time):</strong> {{ formatNum(justifyingTeaPay.ralFte) }}</li>
+                  <li v-if="justifyingTeaPay"><strong>Retribuzione oraria:</strong> {{ justifyingTeaPay.hourly != null ? justifyingTeaPay.hourly.toLocaleString('it-IT', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' €' : '–' }}</li>
+                  <li><strong>Componenti variabili annue:</strong> {{ formatNum(justifyingPerson.variableComponents) }}</li>
+                  <li><strong>Retribuzione totale:</strong> {{ formatNum(justifyingPerson.totalSalary) }}</li>
+                  <li><strong>Genere:</strong> {{ justifyingPerson.gender === 'M' ? 'M' : justifyingPerson.gender === 'F' ? 'F' : '–' }}</li>
+                </ul>
+              </div>
+              <div
+                v-if="justifyingPerson.justifySource === 'job_grading' || justifyingPerson.justifySource === 'ccnl_level' || justifyingPerson.justifySource === 'cost_center'"
+                class="person-justify-summary-card person-justify-summary-card--hay"
+              >
+                <h4 class="person-justify-summary-title">Punteggi ruolo (0–100)</h4>
+                <ul class="person-justify-summary-list person-justify-hay-list">
+                  <li v-for="f in TRANSPARENCY_FLAT_FACTORS" :key="f.id">
+                    <strong>{{ f.label }}:</strong> {{ roleTr(justifyingPerson.roleScoresBlock, f.id) ?? '–' }}
+                  </li>
+                  <li><strong>Punteggio parametrico:</strong> {{ justifyingPerson.trParametricScore100 != null ? formatNum(justifyingPerson.trParametricScore100) + '/100' : '–' }} <span class="muted">(media pesata 0–100: {{ justifyingPerson.trWeightedScore != null ? formatNum(justifyingPerson.trWeightedScore) : '–' }})</span></li>
+                </ul>
+              </div>
+            </div>
+
+            <div v-if="justifyingTeaPay" class="person-justify-summary-card tea-pay-card">
+              <h4 class="person-justify-summary-title">Composizione tracciato TEA</h4>
+              <p class="justify-metric-note muted">
+                Le voci mensili non sono sommate alla RAL e non sono state riproporzionate sulle date.
+                Part-time {{ justifyingTeaPay.partTimePct }}%<span v-if="justifyingTeaPay.weeklyFullTimeHours"> · orario full-time {{ justifyingTeaPay.weeklyFullTimeHours }} ore</span>.
+              </p>
+              <ul class="person-justify-summary-list">
+                <li v-for="row in justifyingTeaPay.monthly" :key="'m-' + row.label">
+                  <strong>{{ row.label }}:</strong> {{ formatNum(row.amount) }} <span class="muted">mensile</span>
+                </li>
+                <li><strong>Totale voci fisse mensili:</strong> {{ formatNum(justifyingTeaPay.monthlyTotal) }} <span class="muted">non usato nei KPI</span></li>
+                <li v-for="row in justifyingTeaPay.annual" :key="'a-' + row.label">
+                  <strong>{{ row.label }}:</strong> {{ formatNum(row.amount) }} <span class="muted">{{ row.note }}</span>
+                </li>
+              </ul>
+            </div>
+
+            <div class="justify-person-metrics">
+              <div class="justify-metric-card">
+                <div class="justify-metric-title">Anzianità</div>
+                <p class="justify-metric-line">
+                  <strong>Da file:</strong>
+                  {{ formatSeniorityDisplay(justifyingPerson.seniority) }}
+                </p>
+                <p class="justify-metric-line">
+                  <strong>Scostamento vs media del {{ justifyGroupContextNoun(justifyingPerson.justifySource) }}:</strong>
+                  <span v-if="justifyingPerson.seniorityPctVsFascia != null" class="justify-metric-pct">
+                    {{ formatPctSigned(justifyingPerson.seniorityPctVsFascia) }}
+                  </span>
+                  <span v-else class="muted">n/d</span>
+                  <span v-if="justifyingPerson.fascAvgSeniorityYears != null" class="justify-metric-ref muted">
+                    (media {{ justifyGroupContextNoun(justifyingPerson.justifySource) }}: {{ justifyingPerson.fascAvgSeniorityYears.toFixed(1) }} anni)
+                  </span>
+                </p>
+                <p v-if="justifyingPerson.seniorityPctVsFascia == null" class="justify-metric-note muted">
+                  Il confronto % richiede anzianità espressa in anni numerici o data di ingresso; in alcuni formati non è calcolabile.
+                </p>
+              </div>
+              <div class="justify-metric-card">
+                <div class="justify-metric-title">Anzianità nel ruolo</div>
+                <p class="justify-metric-line">
+                  <strong>Da file:</strong>
+                  {{ formatSeniorityDisplay(justifyingPerson.roleSeniority) }}
+                </p>
+                <p class="justify-metric-line">
+                  <strong>Scostamento vs media del {{ justifyGroupContextNoun(justifyingPerson.justifySource) }}:</strong>
+                  <span v-if="justifyingPerson.roleSeniorityPctVsFascia != null" class="justify-metric-pct">
+                    {{ formatPctSigned(justifyingPerson.roleSeniorityPctVsFascia) }}
+                  </span>
+                  <span v-else class="muted">n/d</span>
+                  <span v-if="justifyingPerson.fascAvgRoleSeniorityYears != null" class="justify-metric-ref muted">
+                    (media {{ justifyGroupContextNoun(justifyingPerson.justifySource) }}: {{ justifyingPerson.fascAvgRoleSeniorityYears.toFixed(1) }} anni)
+                  </span>
+                </p>
+                <p v-if="justifyingPerson.roleSeniorityPctVsFascia == null && justifyingPerson.roleSeniority == null" class="justify-metric-note muted">
+                  Colonna non mappata nel file Excel.
+                </p>
+              </div>
+              <div class="justify-metric-card">
+                <div class="justify-metric-title">Performance</div>
+                <p class="justify-metric-line">
+                  <strong>Punteggio performance:</strong>
+                  <template v-if="justifyingTeaPay?.performanceOnFive != null">{{ justifyingTeaPay.performanceOnFive }} / 5 <span class="muted">({{ justifyingPerson.performanceScore }} / 100)</span></template>
+                  <template v-else>{{ justifyingPerson.performanceScore != null ? justifyingPerson.performanceScore + ' / 100' : 'Non presente nel file' }}</template>
+                </p>
+                <p class="justify-metric-line">
+                  <strong>Scostamento vs media del {{ justifyGroupContextNoun(justifyingPerson.justifySource) }}:</strong>
+                  <span v-if="justifyingPerson.performancePctVsFascia != null" class="justify-metric-pct">
+                    {{ formatPctSigned(justifyingPerson.performancePctVsFascia) }}
+                  </span>
+                  <span v-else class="muted">n/d</span>
+                  <span v-if="justifyingPerson.fascAvgPerformance != null" class="justify-metric-ref muted">
+                    (media {{ justifyGroupContextNoun(justifyingPerson.justifySource) }}: {{ justifyingPerson.fascAvgPerformance.toFixed(1) }})
+                  </span>
+                </p>
+              </div>
+            </div>
+            <p class="justify-hint">Inserisci un giustificativo sulla posizione retributiva (puoi richiamare anzianità e performance come elementi oggettivi, se coerenti con i dati).</p>
+
+            <div class="person-justify-textarea-block">
+              <label class="person-justify-textarea-label" for="person-justify-textarea">Testo del giustificativo</label>
+              <div class="person-justify-textarea-with-upload">
+                <textarea
+                  id="person-justify-textarea"
+                  v-model="justifyText"
+                  class="justify-textarea person-justify-textarea-field"
+                  rows="6"
+                  placeholder="Motivo..."
+                ></textarea>
+                <div class="person-justify-textarea-actions" role="group" aria-label="Allegati e informazioni documenti">
+                  <input
+                    ref="personJustifyFileInput"
+                    type="file"
+                    class="person-justify-file-input"
+                    multiple
+                    accept=".pdf,.png,.jpg,.jpeg,.doc,.docx,application/pdf,image/*"
+                    @change="onPersonJustifyFilesSelected"
+                  />
+                  <button
+                    type="button"
+                    class="person-justify-icon-btn"
+                    title="Carica documento giustificativo"
+                    aria-label="Carica documento giustificativo"
+                    @click="triggerPersonJustifyFile"
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20" aria-hidden="true"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                  </button>
+                  <div class="justify-doc-info-wrap">
+                    <button
+                      type="button"
+                      class="justify-info-trigger"
+                      aria-label="Informazioni sui documenti da allegare"
+                      aria-describedby="person-justify-doc-tooltip-tab"
+                    >
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+                    </button>
+                    <div id="person-justify-doc-tooltip-tab" class="justify-doc-tooltip" role="tooltip">
+                      <p class="justify-doc-tooltip-title">Documentazione utile per categoria</p>
+                      <p v-for="(sec, idx) in PERSON_JUSTIFY_DOC_INFO_SECTIONS" :key="idx" class="justify-doc-tooltip-p">
+                        <strong>{{ sec.title }}:</strong> {{ sec.body }}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="justify-actions justify-actions-tab">
+              <button
+                type="button"
+                class="btn-pay-communication btn-pay-communication--profile"
+                :disabled="payCommLoadingIndex === justifyingPerson.key"
+                title="Genera PDF comunicazione retributiva per questo dipendente"
+                @click="exportPayCommunicationForJustifyingPerson"
+              >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16" aria-hidden="true"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6M12 18v-6M9 15l3 3 3-3"/></svg>
+                {{ payCommLoadingIndex === justifyingPerson.key ? 'Generazione PDF…' : 'Genera comunicazione retributiva (PDF)' }}
+              </button>
+              <span class="justify-actions-spacer"></span>
+              <button type="button" class="btn-secondary" @click="cancelPersonJustify">Annulla</button>
+              <button type="button" class="btn-primary" @click="savePersonJustify">Salva giustificativo</button>
+            </div>
+          </template>
+        </div>
+
+        <div class="mapping-actions">
+          <button class="btn-secondary" @click="goToMappingFromResults">Modifica mapping</button>
+          <button class="btn-primary" @click="startNuovaAnalisi">Nuova analisi</button>
+        </div>
+
+        <!-- Modal giustificativo -->
+        <div v-if="justifyingLevel != null" class="justify-overlay" @click.self="cancelJustify">
+          <div class="justify-modal">
+            <h3>Giustificativo – {{ justifyingLevel }}</h3>
+            <p class="justify-hint">Inserisci un giustificativo per la deviazione retributiva superiore a ±5% dalla media complessiva.</p>
+            <textarea v-model="justifyText" class="justify-textarea" rows="5" placeholder="Motivo..."></textarea>
+            <div class="justify-actions">
+              <span style="flex:1"></span>
+              <button class="btn-secondary" @click="cancelJustify">Annulla</button>
+              <button class="btn-primary" @click="saveJustify">Salva</button>
+            </div>
+          </div>
+        </div>
+        <div v-if="roleValuationModal != null" class="justify-overlay" @click.self="closeRoleValuationModal">
+          <div class="justify-modal justify-modal--wide jg-role-valuation-modal" role="dialog" aria-modal="true" aria-labelledby="jg-role-val-title">
+            <h3 id="jg-role-val-title">Dettaglio valutazione — {{ roleValuationModal.roleName }}</h3>
+            <p class="justify-hint jg-role-valuation-edit-hint">
+              Modifica i <strong>punteggi (0–100)</strong> per ogni fattore e salva. Apri <strong>Info analisi</strong> per le definizioni dei livelli.
+            </p>
+            <template v-if="roleValuationModalRb">
+              <div class="jg-role-valuation-table-wrap">
+                <table class="jg-role-valuation-table">
+                  <thead>
+                    <tr>
+                      <th>Macro-area (peso sul totale)</th>
+                      <th>Fattore (peso sull’area)</th>
+                      <th>Punteggio (0–100)</th>
+                      <th>Contributo (pt /100)</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <template v-for="area in TRANSPARENCY_MACRO_AREAS" :key="'vm-' + area.id + '-' + roleValuationModalRb.role">
+                      <tr v-for="(f, fi) in area.factors" :key="f.id">
+                        <td v-if="fi === 0" :rowspan="area.factors.length" class="jg-rv-mac">
+                          <strong>{{ area.label }}</strong>
+                          <div class="jg-rv-w">{{ area.weightPct }}% sul totale valutazione</div>
+                        </td>
+                        <td class="jg-rv-fac">
+                          <strong>{{ f.label }}</strong>
+                          <div class="jg-rv-w">{{ f.weightPct }}% · {{ f.description }}</div>
+                        </td>
+                        <td class="jg-rv-score">
+                          <input
+                            v-model.number="roleValuationForm[f.id]"
+                            type="number"
+                            min="0"
+                            max="100"
+                            step="1"
+                            class="mapping-select jg-rv-input"
+                            :aria-label="'Punteggio ' + f.label"
+                            @click.stop
+                          />
+                        </td>
+                        <td class="jg-rv-pt" title="% peso sul totale × punteggio / 100">{{ formatFactorParametricContributionFromForm(f) }}</td>
+                      </tr>
+                    </template>
+                  </tbody>
+                  <tfoot>
+                    <tr class="jg-rv-foot">
+                      <td colspan="2"><strong>Punteggio parametrico (0–100)</strong></td>
+                      <td class="muted">—</td>
+                      <td class="jg-rv-foot-score">
+                        <strong>{{ formatNum(previewValuationFormParametric100()) }}</strong>
+                        <span class="muted jg-rv-foot-hint">Σ (% peso × punteggio / 100); es. 10% e punteggio 80 → 8 pt</span>
+                      </td>
+                    </tr>
+                    <tr class="jg-rv-foot jg-rv-foot--sub">
+                      <td colspan="2"><strong>Media pesata (scala 0–100)</strong></td>
+                      <td colspan="2" class="jg-rv-foot-score">
+                        <strong>{{ formatNum(previewValuationFormWeighted()) }}</strong>
+                        <span class="muted jg-rv-foot-hint">Σ (punteggio × peso fattore)</span>
+                      </td>
+                    </tr>
+                  </tfoot>
+                </table>
+              </div>
+            </template>
+            <p v-else class="muted jg-role-valuation-missing">Dati ruolo non disponibili.</p>
+            <div class="justify-actions">
+              <button type="button" class="btn-secondary" @click="closeRoleValuationModal">Annulla</button>
+              <span style="flex: 1"></span>
+              <button type="button" class="btn-primary" @click="saveRoleValuationModal">Salva e ricalcola fasce</button>
+            </div>
+          </div>
+        </div>
+
+        <div
+          v-if="jobGradingCriteriaModalOpen"
+          class="eu-outlier-modal-backdrop jg-criteria-backdrop"
+          @click.self="jobGradingCriteriaModalOpen = false"
+        >
+          <div class="jg-criteria-modal" role="dialog" aria-modal="true" aria-labelledby="jg-crit-title">
+            <h3 id="jg-crit-title">Criteri valutativi — trasparenza retributiva</h3>
+            <p class="jg-criteria-intro muted">
+              Quattro macro-aree con peso sul totale. Ogni fattore ha peso proprio e una scala da <strong>0</strong> (minimo) a <strong>100</strong> (massimo).
+            </p>
+            <div class="jg-criteria-table-wrap">
+              <table class="jg-criteria-table">
+                <thead>
+                  <tr>
+                    <th>Macro-area</th>
+                    <th>Fattore (peso)</th>
+                    <th>In sintesi</th>
+                    <th>0</th>
+                    <th>25</th>
+                    <th>50</th>
+                    <th>75</th>
+                    <th>100</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template v-for="area in TRANSPARENCY_MACRO_AREAS" :key="area.id">
+                    <tr v-for="(f, fi) in area.factors" :key="f.id">
+                      <td v-if="fi === 0" :rowspan="area.factors.length" class="jg-mac-area">
+                        <strong>{{ area.label }}</strong>
+                        <div class="jg-mac-w">{{ area.weightPct }}%</div>
+                      </td>
+                      <td class="jg-crit-factor">
+                        <strong>{{ f.label }}</strong>
+                        <span class="jg-f-w">{{ f.weightPct }}%</span>
+                      </td>
+                      <td class="jg-crit-desc">{{ f.description }}</td>
+                      <td v-for="(lvl, li) in f.levels" :key="li" class="jg-crit-lvl">{{ lvl }}</td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+            <div class="jg-criteria-actions">
+              <button type="button" class="btn-primary" @click="jobGradingCriteriaModalOpen = false">Chiudi</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </template>
+
+    <!-- Analisi storico + simulazione assunzione -->
+    <template v-else-if="showInsights">
+      <div class="analisi-content">
+        <h2 class="analisi-title">Analisi storico</h2>
+        <p class="analisi-desc">
+          Andamento delle analisi salvate e simulazione di una nuova assunzione: organico, gap di genere e medie delle fasce di grading.
+        </p>
+
+        <div class="results-subtabs eu-results-tabs insights-subtabs">
+          <button type="button" class="subtab" :class="{ active: insightsPane === 'andamento' }" @click="insightsPane = 'andamento'">
+            Andamento
+          </button>
+          <button type="button" class="subtab" :class="{ active: insightsPane === 'simulazione' }" @click="insightsPane = 'simulazione'">
+            Simulazione assunzione
+          </button>
+        </div>
+
+        <div v-if="insightsPane === 'andamento'">
+          <p v-if="storicoLoading && historyView.points.length === 0" class="storico-status">Caricamento storico…</p>
+          <p v-if="storicoError" class="upload-error">{{ storicoError }}</p>
+          <div v-if="!storicoLoading && historyView.points.length === 0 && !storicoError" class="storico-empty">
+            Nessuna analisi nello storico. Completa un’analisi: viene salvata in automatico e compare qui.
+          </div>
+
+          <template v-if="historyView.points.length">
+            <div class="hist-kpis">
+              <div class="hist-kpi">
+                <span class="hist-kpi-label">Analisi salvate</span>
+                <strong>{{ historyView.points.length }}</strong>
+              </div>
+              <div class="hist-kpi">
+                <span class="hist-kpi-label">Organico ultimo</span>
+                <strong>{{ historyView.latest.snapshot.n }}</strong>
+                <span v-if="historyView.previous" class="hist-kpi-delta">
+                  {{ formatDeltaCount(deltaOf(historyView.latest.snapshot.n, historyView.previous.snapshot.n)) }}
+                  vs precedente
+                </span>
+              </div>
+              <div class="hist-kpi">
+                <span class="hist-kpi-label">Media totale</span>
+                <strong>{{ formatEuro(historyView.latest.snapshot.avgTotal) }}</strong>
+                <span v-if="historyView.previous" class="hist-kpi-delta">
+                  {{ formatDeltaEuro(deltaOf(historyView.latest.snapshot.avgTotal, historyView.previous.snapshot.avgTotal)) }}
+                </span>
+              </div>
+              <div class="hist-kpi">
+                <span class="hist-kpi-label">Gap medio M/F</span>
+                <strong>{{ formatGapMforF(historyView.latest.snapshot.gapMean) }}</strong>
+                <span v-if="historyView.previous" class="hist-kpi-delta">
+                  {{ formatDeltaPct(deltaOf(historyView.latest.snapshot.gapMean, historyView.previous.snapshot.gapMean)) }}
+                </span>
+              </div>
+            </div>
+
+            <h3 class="hist-heading">Gap medio nel tempo</h3>
+            <p class="hist-note">Gap sulla retribuzione totale: positivo significa uomini pagati di più. Il confronto usa le analisi salvate, dalla più vecchia alla più recente.</p>
+            <div class="hist-gap-chart">
+              <div v-for="p in historyView.points" :key="p.id" class="hist-gap-col">
+                <div
+                  class="hist-gap-bar"
+                  :class="euGapSeverityClass(p.snapshot.gapMean)"
+                  :style="{ height: historyGapBarHeight(p.snapshot.gapMean) }"
+                  :title="`${p.label} · ${formatGapMforF(p.snapshot.gapMean)}`"
+                ></div>
+                <span class="hist-gap-val">{{ formatPctSigned(p.snapshot.gapMean) }}</span>
+                <span class="hist-gap-date">{{ formatDate(p.createdAt) }}</span>
+              </div>
+            </div>
+
+            <h3 class="hist-heading">Analisi confrontate</h3>
+            <p v-if="historyView.hiddenCount" class="hist-note">
+              Le tabelle di fascia mostrano le ultime {{ historyView.shown.length }} analisi. Nello storico ce ne sono altre {{ historyView.hiddenCount }}.
+            </p>
+            <div class="storico-table-wrap">
+              <table class="storico-table">
+                <thead>
+                  <tr>
+                    <th>Data</th>
+                    <th>Nome</th>
+                    <th>N</th>
+                    <th>N M</th>
+                    <th>N F</th>
+                    <th>Media tot.</th>
+                    <th>Media M</th>
+                    <th>Media F</th>
+                    <th>Gap medio</th>
+                    <th>Gap mediano</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="p in [...historyView.points].reverse()" :key="p.id">
+                    <td>{{ formatDate(p.createdAt) }}</td>
+                    <td class="storico-url">{{ p.label }}</td>
+                    <td>{{ p.snapshot.n }}</td>
+                    <td>{{ p.snapshot.nMen }}</td>
+                    <td>{{ p.snapshot.nWomen }}</td>
+                    <td>{{ formatEuro(p.snapshot.avgTotal) }}</td>
+                    <td>{{ formatEuro(p.snapshot.avgMen) }}</td>
+                    <td>{{ formatEuro(p.snapshot.avgWomen) }}</td>
+                    <td>{{ formatGapMforF(p.snapshot.gapMean) }}</td>
+                    <td>{{ formatGapMforF(p.snapshot.gapMedian) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h3 class="hist-heading">Medie per livello</h3>
+            <div class="storico-table-wrap">
+              <table class="storico-table">
+                <thead>
+                  <tr>
+                    <th>Livello</th>
+                    <th v-for="p in historyView.shown" :key="p.id">{{ formatDate(p.createdAt) }}</th>
+                    <th>Delta ultima</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="row in historyView.levels" :key="row.level">
+                    <td>{{ row.level }}</td>
+                    <td v-for="(cell, idx) in row.cells" :key="historyView.shown[idx].id">
+                      <template v-if="cell">{{ formatEuro(cell.avgTotal) }} <span class="hist-n">n {{ cell.n }}</span></template>
+                      <template v-else>–</template>
+                    </td>
+                    <td>{{ formatDeltaEuro(deltaOf(row.cells.at(-1)?.avgTotal, row.cells.length > 1 ? row.cells.at(-2)?.avgTotal : null)) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h3 class="hist-heading">Medie per fascia di grading</h3>
+            <p class="hist-note">Ogni riga è una fascia di punteggio sulla popolazione intera. La media è la retribuzione totale annua.</p>
+            <div v-if="historyView.bands.length === 0" class="storico-empty">Nessuna fascia nelle analisi salvate.</div>
+            <div v-else class="storico-table-wrap">
+              <table class="storico-table">
+                <thead>
+                  <tr>
+                    <th>Livello</th>
+                    <th>Fascia</th>
+                    <th v-for="p in historyView.shown" :key="p.id">{{ formatDate(p.createdAt) }}</th>
+                    <th>Delta media</th>
+                    <th>Delta gap</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="row in historyView.bands" :key="row.key">
+                    <td>{{ row.level || '–' }}</td>
+                    <td>{{ row.fasciaLabel || '–' }} <span class="hist-n">{{ row.score }}/100</span></td>
+                    <td v-for="(cell, idx) in row.cells" :key="historyView.shown[idx].id">
+                      <template v-if="cell">
+                        {{ formatEuro(cell.avgTotal) }}
+                        <span class="hist-n">n {{ cell.n }} · {{ formatGapMforF(cell.gapPct) }}</span>
+                      </template>
+                      <template v-else>–</template>
+                    </td>
+                    <td>{{ formatDeltaEuro(deltaOf(row.cells.at(-1)?.avgTotal, row.cells.length > 1 ? row.cells.at(-2)?.avgTotal : null)) }}</td>
+                    <td>{{ formatDeltaPct(deltaOf(row.cells.at(-1)?.gapPct, row.cells.length > 1 ? row.cells.at(-2)?.gapPct : null)) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </template>
+        </div>
+
+        <div v-else class="sim-pane">
+          <p class="hist-note">
+            Il calcolo aggiunge un dipendente ipotetico ai dati dell’analisi aperta. La fascia è quella del ruolo (punteggio di grading). Le medie sono sulla retribuzione totale annua, come nel job grading.
+          </p>
+          <p v-if="!canSimulate" class="upload-error">Apri o completa un’analisi: la simulazione parte dai dipendenti già caricati.</p>
+
+          <form class="sim-form" @submit.prevent="runHireSimulation">
+            <label class="sim-field">
+              <span>Nome</span>
+              <input v-model="simForm.name" type="text" class="url-input" placeholder="Es. Nuova assunzione" :disabled="!canSimulate" />
+            </label>
+            <label class="sim-field">
+              <span>Genere</span>
+              <select v-model="simForm.gender" class="url-input" :disabled="!canSimulate">
+                <option value="F">Donna</option>
+                <option value="M">Uomo</option>
+              </select>
+            </label>
+            <label class="sim-field">
+              <span>Livello CCNL</span>
+              <input v-model="simForm.level" type="text" class="url-input" list="sim-level-options" placeholder="Livello" :disabled="!canSimulate" />
+              <datalist id="sim-level-options">
+                <option v-for="level in simLevelOptions" :key="level" :value="level"></option>
+              </datalist>
+            </label>
+            <label class="sim-field">
+              <span>Ruolo</span>
+              <input v-model="simForm.role" type="text" class="url-input" list="sim-role-options" placeholder="Ruolo esistente o nuovo" :disabled="!canSimulate" />
+              <datalist id="sim-role-options">
+                <option v-for="role in simRoleOptions" :key="role" :value="role"></option>
+              </datalist>
+            </label>
+            <label class="sim-field">
+              <span>Retribuzione base annua</span>
+              <input v-model="simForm.baseSalary" type="text" inputmode="decimal" class="url-input" placeholder="Es. 32000" :disabled="!canSimulate" />
+            </label>
+            <label class="sim-field">
+              <span>Componenti variabili annue</span>
+              <input v-model="simForm.variableComponents" type="text" inputmode="decimal" class="url-input" placeholder="Es. 2000" :disabled="!canSimulate" />
+            </label>
+            <label class="sim-field">
+              <span>Part-time %</span>
+              <input v-model.number="simForm.partTimePct" type="number" min="1" max="100" class="url-input" :disabled="!canSimulate" />
+            </label>
+            <div class="sim-actions">
+              <button type="submit" class="btn-primary" :disabled="!canSimulate">Calcola ripercussioni</button>
+            </div>
+          </form>
+          <p v-if="simError" class="upload-error">{{ simError }}</p>
+
+          <div v-if="simResult" class="sim-result">
+            <h3 class="hist-heading">Nuovo dipendente</h3>
+            <div class="hist-kpis">
+              <div class="hist-kpi">
+                <span class="hist-kpi-label">{{ simResult.employee.name }}</span>
+                <strong>{{ simResult.employee.gender === 'M' ? 'Uomo' : 'Donna' }}</strong>
+                <span class="hist-kpi-delta">{{ simResult.employee.role }} · {{ simResult.placement?.level || simForm.level }}</span>
+              </div>
+              <div class="hist-kpi">
+                <span class="hist-kpi-label">Retribuzione totale</span>
+                <strong>{{ formatEuro(simResult.employee.totalSalary) }}</strong>
+                <span class="hist-kpi-delta">Base {{ formatEuro(simResult.employee.baseSalary) }} · var. {{ formatEuro(simResult.employee.variableComponents) }}</span>
+              </div>
+              <div class="hist-kpi">
+                <span class="hist-kpi-label">Fascia</span>
+                <strong>{{ simResult.placement?.fasciaLabel || '–' }}</strong>
+                <span class="hist-kpi-delta">Scostamento vs nuova media {{ formatPctSigned(simResult.employee.deviationPct) }}</span>
+              </div>
+            </div>
+            <p v-if="simResult.roleMove.moved" class="hist-note">
+              Il punteggio medio del ruolo passa da {{ formatNum(simResult.roleMove.beforeScore) }} a {{ formatNum(simResult.roleMove.afterScore) }}.
+              La fascia del ruolo passa da {{ simResult.roleMove.beforeFascia || 'nessuna' }} a {{ simResult.roleMove.afterFascia || '–' }}.
+            </p>
+            <p v-else-if="!simResult.roleMove.beforeFascia && simResult.placement?.newFascia" class="hist-note">
+              Ruolo nuovo: apre una fascia che prima non c’era. La media di quella fascia coincide con la retribuzione del nuovo ingresso.
+            </p>
+            <p v-else-if="!simResult.roleMove.beforeFascia" class="hist-note">
+              Ruolo nuovo: entra nella fascia {{ simResult.placement?.fasciaLabel || '–' }}. La media si ricalcola con il nuovo ingresso.
+            </p>
+            <p v-else class="hist-note">
+              Il ruolo resta nella stessa fascia. Cambia la media, e con essa lo scostamento di chi è già dentro.
+            </p>
+
+            <h3 class="hist-heading">Azienda, prima e dopo</h3>
+            <div class="storico-table-wrap">
+              <table class="storico-table">
+                <thead>
+                  <tr><th>Indicatore</th><th>Prima</th><th>Dopo</th><th>Delta</th></tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Dipendenti</td>
+                    <td>{{ simResult.beforeKpi.n }}</td>
+                    <td>{{ simResult.afterKpi.n }}</td>
+                    <td>{{ deltaOf(simResult.afterKpi.n, simResult.beforeKpi.n) }}</td>
+                  </tr>
+                  <tr>
+                    <td>Media totale</td>
+                    <td>{{ formatEuro(simResult.beforeKpi.avgTotal) }}</td>
+                    <td>{{ formatEuro(simResult.afterKpi.avgTotal) }}</td>
+                    <td>{{ formatDeltaEuro(deltaOf(simResult.afterKpi.avgTotal, simResult.beforeKpi.avgTotal)) }}</td>
+                  </tr>
+                  <tr>
+                    <td>Media base</td>
+                    <td>{{ formatEuro(simResult.beforeKpi.avgBase) }}</td>
+                    <td>{{ formatEuro(simResult.afterKpi.avgBase) }}</td>
+                    <td>{{ formatDeltaEuro(deltaOf(simResult.afterKpi.avgBase, simResult.beforeKpi.avgBase)) }}</td>
+                  </tr>
+                  <tr>
+                    <td>Media variabili</td>
+                    <td>{{ formatEuro(simResult.beforeKpi.avgVar) }}</td>
+                    <td>{{ formatEuro(simResult.afterKpi.avgVar) }}</td>
+                    <td>{{ formatDeltaEuro(deltaOf(simResult.afterKpi.avgVar, simResult.beforeKpi.avgVar)) }}</td>
+                  </tr>
+                  <tr>
+                    <td>Media uomini</td>
+                    <td>{{ formatEuro(simResult.beforeKpi.avgMen) }}</td>
+                    <td>{{ formatEuro(simResult.afterKpi.avgMen) }}</td>
+                    <td>{{ formatDeltaEuro(deltaOf(simResult.afterKpi.avgMen, simResult.beforeKpi.avgMen)) }}</td>
+                  </tr>
+                  <tr>
+                    <td>Media donne</td>
+                    <td>{{ formatEuro(simResult.beforeKpi.avgWomen) }}</td>
+                    <td>{{ formatEuro(simResult.afterKpi.avgWomen) }}</td>
+                    <td>{{ formatDeltaEuro(deltaOf(simResult.afterKpi.avgWomen, simResult.beforeKpi.avgWomen)) }}</td>
+                  </tr>
+                  <tr>
+                    <td>Gap medio</td>
+                    <td>{{ formatGapMforF(simResult.beforeKpi.gapMean) }}</td>
+                    <td>{{ formatGapMforF(simResult.afterKpi.gapMean) }}</td>
+                    <td>{{ formatDeltaPct(deltaOf(simResult.afterKpi.gapMean, simResult.beforeKpi.gapMean)) }}</td>
+                  </tr>
+                  <tr>
+                    <td>Gap mediano</td>
+                    <td>{{ formatGapMforF(simResult.beforeKpi.gapMedian) }}</td>
+                    <td>{{ formatGapMforF(simResult.afterKpi.gapMedian) }}</td>
+                    <td>{{ formatDeltaPct(deltaOf(simResult.afterKpi.gapMedian, simResult.beforeKpi.gapMedian)) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h3 class="hist-heading">Fascia di ingresso</h3>
+            <div v-if="simResult.placement" class="storico-table-wrap">
+              <table class="storico-table">
+                <thead>
+                  <tr><th></th><th>Prima</th><th>Dopo</th><th>Delta</th></tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>N in fascia</td>
+                    <td>{{ simResult.placement.nBefore }}</td>
+                    <td>{{ simResult.placement.nAfter }}</td>
+                    <td>{{ deltaOf(simResult.placement.nAfter, simResult.placement.nBefore) }}</td>
+                  </tr>
+                  <tr>
+                    <td>Media totale fascia</td>
+                    <td>{{ formatEuro(simResult.placement.avgTotalBefore) }}</td>
+                    <td>{{ formatEuro(simResult.placement.avgTotalAfter) }}</td>
+                    <td>{{ formatDeltaEuro(deltaOf(simResult.placement.avgTotalAfter, simResult.placement.avgTotalBefore)) }}</td>
+                  </tr>
+                  <tr>
+                    <td>Media base fascia</td>
+                    <td>{{ formatEuro(simResult.placement.avgBaseBefore) }}</td>
+                    <td>{{ formatEuro(simResult.placement.avgBaseAfter) }}</td>
+                    <td>{{ formatDeltaEuro(deltaOf(simResult.placement.avgBaseAfter, simResult.placement.avgBaseBefore)) }}</td>
+                  </tr>
+                  <tr>
+                    <td>Media variabili fascia</td>
+                    <td>{{ formatEuro(simResult.placement.avgVarBefore) }}</td>
+                    <td>{{ formatEuro(simResult.placement.avgVarAfter) }}</td>
+                    <td>{{ formatDeltaEuro(deltaOf(simResult.placement.avgVarAfter, simResult.placement.avgVarBefore)) }}</td>
+                  </tr>
+                  <tr>
+                    <td>Media uomini in fascia</td>
+                    <td>{{ simResult.placement.nMenBefore ? formatEuro(simResult.placement.avgMenBefore) : '–' }}</td>
+                    <td>{{ simResult.placement.nMenAfter ? formatEuro(simResult.placement.avgMenAfter) : '–' }}</td>
+                    <td>{{ formatDeltaEuro(deltaOf(simResult.placement.avgMenAfter, simResult.placement.avgMenBefore)) }}</td>
+                  </tr>
+                  <tr>
+                    <td>Media donne in fascia</td>
+                    <td>{{ simResult.placement.nWomenBefore ? formatEuro(simResult.placement.avgWomenBefore) : '–' }}</td>
+                    <td>{{ simResult.placement.nWomenAfter ? formatEuro(simResult.placement.avgWomenAfter) : '–' }}</td>
+                    <td>{{ formatDeltaEuro(deltaOf(simResult.placement.avgWomenAfter, simResult.placement.avgWomenBefore)) }}</td>
+                  </tr>
+                  <tr>
+                    <td>Gap di fascia</td>
+                    <td>{{ formatGapMforF(simResult.placement.gapBefore) }}</td>
+                    <td>{{ formatGapMforF(simResult.placement.gapAfter) }}</td>
+                    <td>{{ formatDeltaPct(deltaOf(simResult.placement.gapAfter, simResult.placement.gapBefore)) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h3 class="hist-heading">Ripercussione sul livello CCNL</h3>
+            <template v-for="group in simResult.levelGroups.filter((g) => g.affected)" :key="group.level">
+              <h4 class="sim-level-title">
+                Livello {{ group.level }}
+                <span v-if="group.isHireLevel" class="hist-n">ingresso</span>
+              </h4>
+              <p class="hist-note">
+                Media di livello {{ formatEuro(group.before?.avgTotal) }} → {{ formatEuro(group.after?.avgTotal) }}
+                ({{ formatDeltaEuro(deltaOf(group.after?.avgTotal, group.before?.avgTotal)) }}).
+                {{ formatGapMforF(group.before?.gapPct) }} → {{ formatGapMforF(group.after?.gapPct) }}.
+              </p>
+            </template>
+
+            <h3 class="hist-heading">Ripercussione sulle fasce</h3>
+            <p class="hist-note">Le fasce sono uniche per punteggio, su tutti i livelli.</p>
+            <div class="storico-table-wrap">
+              <table class="storico-table">
+                <thead>
+                  <tr>
+                    <th>Fascia</th>
+                    <th>N prima</th>
+                    <th>N dopo</th>
+                    <th>Media prima</th>
+                    <th>Media dopo</th>
+                    <th>Delta media</th>
+                    <th>Gap prima</th>
+                    <th>Gap dopo</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="row in (simResult.fasciaRows || []).filter((r) => r.changed)" :key="row.key" class="sim-row-changed">
+                    <td>{{ row.fasciaLabel }} <span class="hist-n">{{ row.score }}/100</span></td>
+                    <td>{{ row.before?.n ?? 0 }}</td>
+                    <td>{{ row.after?.n ?? 0 }}</td>
+                    <td>{{ formatEuro(row.before?.avgTotal) }}</td>
+                    <td>{{ formatEuro(row.after?.avgTotal) }}</td>
+                    <td>{{ formatDeltaEuro(deltaOf(row.after?.avgTotal, row.before?.avgTotal)) }}</td>
+                    <td>{{ formatGapMforF(row.before?.gapPct) }}</td>
+                    <td>{{ formatGapMforF(row.after?.gapPct) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h3 v-if="simResult.colleagueShifts.length" class="hist-heading">Scostamento di chi è già in fascia</h3>
+            <p v-if="simResult.colleagueShifts.length" class="hist-note">
+              La nuova media sposta lo scostamento percentuale dei presenti.
+              <template v-if="simResult.colleagueShiftCount > simResult.colleagueShifts.length">
+                Qui i {{ simResult.colleagueShifts.length }} movimenti più ampi su {{ simResult.colleagueShiftCount }}.
+              </template>
+            </p>
+            <div v-if="simResult.colleagueShifts.length" class="storico-table-wrap">
+              <table class="storico-table">
+                <thead>
+                  <tr>
+                    <th>Persona</th>
+                    <th>Ruolo</th>
+                    <th>Totale</th>
+                    <th>Scost. prima</th>
+                    <th>Scost. dopo</th>
+                    <th>Delta</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="p in simResult.colleagueShifts" :key="p.index">
+                    <td>{{ p.name }}</td>
+                    <td>{{ p.role }}</td>
+                    <td>{{ formatEuro(p.totalSalary) }}</td>
+                    <td>{{ formatPctSigned(p.beforeDev) }}</td>
+                    <td>{{ formatPctSigned(p.afterDev) }}</td>
+                    <td>{{ formatDeltaPct(p.deltaDev) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </template>
+
+    <!-- Storico analisi -->
+    <template v-else-if="showStorico">
+      <div class="analisi-content">
+        <h2 class="analisi-title">Storico Analisi</h2>
+        <p class="analisi-desc">Ogni analisi completata viene salvata per intero in questo browser, insieme a organico, gap e medie di fascia.</p>
+        <p v-if="storicoLoading && storicoList.length === 0" class="storico-status">Caricamento storico…</p>
+        <p v-if="storicoError" class="upload-error">{{ storicoError }}</p>
+        <div v-if="!storicoLoading && storicoList.length === 0 && !storicoError" class="storico-empty">
+          Nessuna analisi salvata.
+        </div>
+        <div v-if="storicoList.length > 0" class="storico-table-wrap">
+          <table class="storico-table">
+            <thead>
+              <tr>
+                <th>Data</th>
+                <th>Nome</th>
+                <th>Dipendenti</th>
+                <th>Media totale</th>
+                <th>Gap medio</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="a in storicoList" :key="a.id">
+                <td>{{ formatDate(a.created_at) }}</td>
+                <td class="storico-url" :title="a.source_url || ''">{{ sourceLabel(a) }}</td>
+                <td>{{ a.snapshot_json?.n ?? a.row_count ?? '–' }}</td>
+                <td>{{ formatEuro(a.snapshot_json?.avgTotal) }}</td>
+                <td>{{ formatGapMforF(a.snapshot_json?.gapMean) }}</td>
+                <td class="storico-actions">
+                  <button
+                    class="btn-view"
+                    :disabled="storicoViewing === a.id"
+                    @click="viewAnalysis(a.id)"
+                  >
+                    {{ storicoViewing === a.id ? '…' : 'Apri' }}
+                  </button>
+                  <button
+                    class="btn-delete"
+                    :disabled="storicoDeleting === a.id"
+                    @click="removeAnalysis(a.id)"
+                  >
+                    {{ storicoDeleting === a.id ? '…' : 'Elimina' }}
+                  </button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="mapping-actions">
+          <button class="btn-secondary" @click="loadStorico">Aggiorna</button>
+        </div>
+      </div>
+    </template>
+    </div>
+    </template>
+    <SalaryReview
+      v-else-if="activeSideItem === 'compensation-salary-review'"
+      :source-people="reviewSourcePeople"
+      :company-name="reportCompanyName"
+    />
+    <div v-else class="section-placeholder">
+      <h2 class="analisi-title">{{ activeSideLabel }}</h2>
+      <p class="analisi-desc">Questa sezione non è disponibile in questa vista.</p>
+    </div>
+    </div>
+  </div>
+
+</template>
+
+<style scoped>
+.app-layout {
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+  gap: 12px;
+  height: 100vh;
+  padding: 12px;
+  overflow: hidden;
+  background: #eef2f6;
+  box-sizing: border-box;
+}
+
+.side-nav {
+  width: 252px;
+  flex: 0 0 252px;
+  min-height: 0;
+  align-self: stretch;
+  margin: 0;
+  padding: 0 12px 16px;
+  background: #fff;
+  border: none;
+  border-radius: 18px;
+  box-shadow: 0 8px 28px rgba(15, 23, 42, 0.08);
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.side-nav::-webkit-scrollbar {
+  width: 8px;
+}
+
+.side-nav::-webkit-scrollbar-thumb {
+  background: #c5cad3;
+  border-radius: 8px;
+}
+
+.side-nav-brand {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  height: 64px;
+  margin: 0 -12px 10px;
+  padding: 0 18px;
+  border-bottom: 1px solid #eef1f5;
+}
+
+.side-nav-logo {
+  display: block;
+  height: 30px;
+  width: auto;
+  max-width: 100%;
+  object-fit: contain;
+  object-position: left center;
+}
+
+.side-nav-kicker {
+  margin: 0.1rem 0 0.35rem 12px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: #3b82f6;
+}
+
+.side-nav-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.side-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  width: 100%;
+  min-height: 44px;
+  padding: 0.55rem 0.7rem;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: #a3acb8;
+  font-family: inherit;
+  font-size: 0.875rem;
+  font-weight: 500;
+  line-height: 1.2;
+  text-align: left;
+  cursor: pointer;
+}
+
+.side-nav-item:hover {
+  background: #f7f8fa;
+  color: #8b95a3;
+}
+
+.side-nav-item.active {
+  background: #f3f5f8;
+  color: #8b95a3;
+  font-weight: 500;
+}
+
+.side-nav-icon {
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.side-nav-icon svg {
+  width: 20px;
+  height: 20px;
+  stroke-linejoin: round;
+}
+
+.side-nav-label {
+  flex: 1;
+  min-width: 0;
+}
+
+.side-nav-chevron {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  opacity: 0.9;
+  transition: transform 0.15s ease;
+}
+
+.side-nav-item.open .side-nav-chevron {
+  transform: rotate(180deg);
+}
+
+.side-nav-sub {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: 0 0 6px 34px;
+}
+
+.side-nav-subitem {
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: #8b95a3;
+  font-family: inherit;
+  font-size: 0.82rem;
+  font-weight: 500;
+  text-align: left;
+  padding: 0.42rem 0.7rem;
+  cursor: pointer;
+}
+
+.side-nav-subitem:hover {
+  background: #f7f8fa;
+}
+
+.side-nav-subitem.active {
+  background: #eef4ff;
+  color: #0a6cd2;
+  font-weight: 650;
+}
+
+.app-main {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  height: auto;
+  overflow: hidden;
+  background: transparent;
+}
+
+.section-placeholder {
+  padding: 2.5rem 2rem;
+}
+
+.tab-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0 1.25rem 0 0.35rem;
+  height: 64px;
+  min-height: 64px;
+  flex-shrink: 0;
+  background: #fff;
+  border-bottom: 1px solid #e6ebf2;
+}
+
+.tab-bar-action {
+  padding: 0.55rem 1.05rem;
+  border-radius: 10px;
+  flex-shrink: 0;
+}
+
+.tabs {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem;
+  border: none;
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 0.875rem;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+  border-bottom: 3px solid transparent;
+  margin-bottom: -1px;
+}
+
+.tab:hover {
+  background: rgba(10, 108, 210, 0.06);
+  color: var(--accent-blue);
+}
+
+.tab.active {
+  color: var(--accent-blue);
+  font-weight: 600;
+  border-bottom-color: var(--accent-blue);
+}
+
+.tab-icon {
+  display: flex;
+  flex-shrink: 0;
+}
+
+.tab-icon svg {
+  width: 18px;
+  height: 18px;
+}
+
+.tab-label {
+  flex: 0 1 auto;
+}
+
+.main-wrap {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  padding: 1.25rem 1.5rem 2rem;
+  overflow-y: auto;
+  background: #f4f6f9;
+}
+
+.analisi-content.panel-card {
+  max-width: none;
+  width: 100%;
+  background: #fff;
+  border: 1px solid #eef1f6;
+  border-radius: 12px;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+  padding: 1.35rem 1.5rem 1.5rem;
+}
+
+.panel-card .analisi-title {
+  color: #2563eb;
+  font-size: 1.05rem;
+  font-weight: 600;
+}
+
+.main-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 1.5rem;
+}
+
+.btn-primary {
+  padding: 0.75rem 1.5rem;
+  border: none;
+  border-radius: var(--radius-lg);
+  background: linear-gradient(310deg, #2152ff 0%, #21d4fd 100%);
+  color: white;
+  font-size: 0.8125rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  box-shadow: var(--shadow-soft);
+  transition: transform 0.15s, box-shadow 0.15s;
+}
+
+.btn-primary:hover {
+  box-shadow: 0 4px 12px rgba(10, 108, 210, 0.35);
+  transform: translateY(-1px);
+}
+
+.btn-icon {
+  width: 40px;
+  height: 40px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--accent-blue);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s;
+}
+
+.btn-icon:hover {
+  background: rgba(10, 108, 210, 0.08);
+}
+
+.btn-icon svg {
+  width: 22px;
+  height: 22px;
+}
+
+.btn-secondary {
+  padding: 0.5rem 0.875rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: white;
+  color: var(--text-primary);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.btn-secondary:hover {
+  background: var(--bg-page);
+  border-color: var(--text-muted);
+}
+
+
+/* Flusso analisi Excel */
+.analisi-content {
+  max-width: 56rem;
+}
+
+.analisi-content.results {
+  max-width: 100%;
+}
+
+.analisi-title {
+  margin: 0 0 0.5rem;
+  font-size: 1.35rem;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.analisi-desc {
+  margin: 0 0 1.5rem;
+  font-size: 0.9375rem;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.results-subtabs {
+  display: flex;
+  gap: 0;
+  margin-bottom: 1.25rem;
+  border-bottom: 1px solid var(--border-light);
+}
+
+.subtab {
+  padding: 0.7rem 1.25rem;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: none;
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.subtab:hover:not(:disabled) {
+  color: var(--accent-blue);
+}
+
+.subtab.active {
+  color: var(--accent-blue);
+  border-bottom-color: var(--accent-blue);
+  font-weight: 600;
+  background: none;
+}
+
+.subtab:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* EU 2023/970 — Global Gender Pay Transparency Dashboard */
+.eu-results-tabs {
+  margin-top: 0.25rem;
+}
+
+/* Tab giustificativo persona (ex modal) */
+.person-justify-tab-panel {
+  margin-bottom: 1.5rem;
+  padding: 1rem 1.15rem;
+  background: var(--bg-card);
+  border: 1px solid var(--border-light);
+  border-radius: 12px;
+  box-shadow: var(--shadow-soft);
+}
+.person-justify-tab-title {
+  margin: 0 0 0.35rem;
+  font-size: 1.15rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  line-height: 1.3;
+}
+.person-justify-tab-lead {
+  margin: 0 0 1rem;
+  font-size: 0.875rem;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+.person-justify-summary-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+@media (min-width: 900px) {
+  .person-justify-summary-grid {
+    grid-template-columns: repeat(3, 1fr);
+  }
+}
+.person-justify-summary-card {
+  border: 1px solid var(--border-light);
+  border-radius: 10px;
+  padding: 0.65rem 0.85rem;
+  background: var(--bg-page);
+}
+.tea-pay-card {
+  margin: 0.75rem 0 1rem;
+}
+.person-justify-summary-title {
+  margin: 0 0 0.5rem;
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+}
+.person-justify-summary-list {
+  margin: 0;
+  padding-left: 1.1rem;
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+.person-justify-hay-list {
+  columns: 1;
+}
+@media (min-width: 600px) {
+  .person-justify-hay-list {
+    columns: 2;
+  }
+}
+
+.justify-actions-tab {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 1rem;
+  width: 100%;
+}
+
+.eu-dashboard-wrap {
+  margin-bottom: 2rem;
+}
+.eu-dash-header {
+  margin-bottom: 1rem;
+}
+.gap-report-export {
+  margin-bottom: 0;
+  margin-top: 1.5rem;
+}
+.eu-panel--page-footer {
+  border-top: 1px solid var(--border-light);
+  padding-top: 1.25rem;
+}
+.gap-report-export-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 0.75rem 1rem;
+  margin: 0.75rem 0;
+}
+.gap-report-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+.gap-report-field-label {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+.gap-report-input {
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--border, #e2e8f0);
+  border-radius: 6px;
+  font-size: 0.9rem;
+  background: var(--bg-primary, #fff);
+  color: var(--text-primary);
+}
+.gap-report-export-options {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin-bottom: 0.75rem;
+  font-size: 0.85rem;
+}
+.gap-report-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.45rem;
+  cursor: pointer;
+}
+.gap-report-export-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+}
+.gap-report-api-hint {
+  font-size: 0.82rem;
+}
+.eu-dash-title {
+  margin: 0 0 0.35rem;
+  font-size: 1.15rem;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+.eu-dash-sub {
+  margin: 0 0 1rem;
+  font-size: 0.875rem;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+.eu-salary-toggle {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+.eu-fte-note {
+  margin: 0.35rem 0 0;
+  font-size: 0.82rem;
+}
+.eu-level-sample {
+  font-size: 0.78rem;
+  max-width: 55%;
+  text-align: right;
+}
+.eu-salary-toggle-label {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-right: 0.25rem;
+}
+.eu-legend-line {
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+  margin: 0 0 1rem;
+}
+.eu-leg {
+  font-size: 0.9rem;
+  margin-right: 0.15rem;
+}
+.eu-leg-green {
+  color: #16a34a;
+}
+.eu-leg-yellow {
+  color: #ca8a04;
+}
+.eu-leg-red {
+  color: #dc2626;
+}
+.gap-severity-green {
+  color: #15803d;
+}
+.gap-severity-yellow {
+  color: #b45309;
+}
+.gap-severity-red {
+  color: #b91c1c;
+}
+.gap-severity-na {
+  color: var(--text-secondary);
+}
+.eu-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+}
+.eu-kpi-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-light);
+  border-radius: 10px;
+  padding: 1rem 1.1rem;
+  box-shadow: var(--shadow-soft);
+}
+.eu-kpi-span {
+  grid-column: 1 / -1;
+}
+@media (min-width: 720px) {
+  .eu-kpi-span {
+    grid-column: span 2;
+  }
+}
+.eu-kpi-label {
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+  margin-bottom: 0.35rem;
+}
+.eu-kpi-value {
+  font-size: 1.35rem;
+  font-weight: 700;
+  line-height: 1.2;
+}
+.eu-kpi-value-inline {
+  font-size: 0.95rem;
+  line-height: 1.4;
+}
+.eu-kpi-hint {
+  margin-top: 0.4rem;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  line-height: 1.35;
+}
+.eu-charts-row {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 1.25rem;
+  margin-bottom: 1.25rem;
+}
+@media (min-width: 900px) {
+  .eu-charts-row {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+.eu-panel {
+  background: var(--bg-card);
+  border: 1px solid var(--border-light);
+  border-radius: 10px;
+  padding: 1rem 1.15rem;
+  box-shadow: var(--shadow-soft);
+}
+.eu-panel-title {
+  margin: 0 0 0.35rem;
+  font-size: 0.95rem;
+  font-weight: 700;
+}
+.eu-panel-desc {
+  margin: 0 0 1rem;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  line-height: 1.45;
+}
+.eu-outlier-panel {
+  margin-bottom: 1.25rem;
+}
+.eu-outlier-table-wrap {
+  overflow-x: auto;
+  margin-bottom: 1rem;
+}
+.eu-outlier-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+}
+.eu-outlier-table th,
+.eu-outlier-table td {
+  border-bottom: 1px solid var(--border-light);
+  padding: 0.45rem 0.5rem;
+  text-align: left;
+  vertical-align: middle;
+}
+.eu-outlier-table th {
+  font-weight: 600;
+  color: var(--text-secondary);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.eu-outlier-num {
+  text-align: right;
+  white-space: nowrap;
+}
+.eu-outlier-reason {
+  color: var(--text-secondary);
+  max-width: 14rem;
+}
+.btn-eu-outlier {
+  font: inherit;
+  font-size: 0.78rem;
+  padding: 0.35rem 0.65rem;
+  border-radius: 6px;
+  border: 1px solid #2152ff;
+  background: linear-gradient(310deg, #2152ff 0%, #21d4fd 100%);
+  color: #fff;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.btn-eu-outlier:hover {
+  filter: brightness(1.05);
+}
+.btn-eu-outlier-ghost {
+  background: transparent;
+  color: #2152ff;
+  border-color: var(--border-light);
+}
+.eu-outlier-excluded {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px dashed var(--border-light);
+}
+.eu-outlier-excluded-title {
+  margin: 0 0 0.5rem;
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+.eu-outlier-excluded-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.eu-outlier-excluded-item {
+  padding: 0.65rem 0;
+  border-bottom: 1px solid var(--border-light);
+}
+.eu-outlier-excluded-item:last-child {
+  border-bottom: none;
+}
+.eu-outlier-ex-main {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.eu-outlier-ex-name {
+  font-weight: 600;
+}
+.eu-outlier-ex-note {
+  margin: 0.35rem 0 0.5rem;
+  font-size: 0.82rem;
+  line-height: 1.4;
+  color: var(--text-secondary);
+}
+.eu-outlier-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  background: rgba(15, 23, 42, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+}
+.eu-outlier-modal {
+  background: var(--bg-card);
+  border: 1px solid var(--border-light);
+  border-radius: 12px;
+  padding: 1.25rem 1.35rem;
+  max-width: 28rem;
+  width: 100%;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.18);
+}
+.eu-outlier-modal h4 {
+  margin: 0 0 0.35rem;
+  font-size: 1.05rem;
+}
+.eu-outlier-modal-sub {
+  margin: 0 0 1rem;
+  font-size: 0.85rem;
+}
+.eu-outlier-label {
+  display: block;
+  font-size: 0.78rem;
+  font-weight: 600;
+  margin-bottom: 0.35rem;
+  color: var(--text-secondary);
+}
+.eu-outlier-textarea {
+  width: 100%;
+  box-sizing: border-box;
+  font: inherit;
+  font-size: 0.88rem;
+  padding: 0.5rem 0.65rem;
+  border-radius: 8px;
+  border: 1px solid var(--border-light);
+  background: var(--bg-page);
+  color: inherit;
+  resize: vertical;
+  min-height: 5rem;
+  margin-bottom: 1rem;
+}
+.eu-outlier-modal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  justify-content: flex-end;
+}
+.eu-quartile-chart {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 0.65rem;
+}
+.eu-quartile-col {
+  flex: 1;
+  text-align: center;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+}
+.eu-quartile-col--clickable {
+  cursor: pointer;
+  border-radius: 8px;
+  padding: 0.25rem 0.15rem;
+  transition: background 0.15s ease, box-shadow 0.15s ease;
+}
+.eu-quartile-col--clickable:hover {
+  background: var(--bg-page);
+}
+.eu-quartile-col--expanded {
+  background: var(--bg-page);
+  box-shadow: inset 0 0 0 2px var(--accent-blue, #3b82f6);
+}
+.eu-quartile-people {
+  margin-top: 1rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border-light);
+}
+.eu-quartile-people-title {
+  margin: 0 0 0.5rem;
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+.eu-quartile-table-row--clickable {
+  cursor: pointer;
+}
+.eu-quartile-table-row--clickable:hover {
+  background: var(--bg-page);
+}
+.eu-quartile-table-row--expanded {
+  background: var(--bg-page);
+  font-weight: 600;
+}
+.eu-q-label {
+  font-weight: 700;
+  font-size: 0.85rem;
+  margin-bottom: 0.45rem;
+}
+.eu-q-chart-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  flex: 1;
+  min-height: 0;
+}
+.eu-q-pair {
+  display: flex;
+  gap: 0.45rem;
+  justify-content: center;
+  align-items: flex-end;
+  flex-shrink: 0;
+}
+.eu-q-bar-col {
+  flex: 0 0 44px;
+  display: flex;
+  justify-content: center;
+}
+.eu-q-bar-track {
+  width: 100%;
+  height: 100px;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  background: var(--bg-page);
+  border-radius: 6px 6px 0 0;
+  border: 1px solid var(--border-light);
+  border-bottom: none;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+.eu-q-bar {
+  width: 100%;
+  min-height: 2px;
+  border-radius: 4px 4px 0 0;
+  transition: height 0.2s ease;
+  flex-shrink: 0;
+}
+.eu-q-bar-m {
+  background: linear-gradient(180deg, #3b82f6, #1d4ed8);
+}
+.eu-q-bar-f {
+  background: linear-gradient(180deg, #ec4899, #be185d);
+}
+.eu-q-amounts {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  min-height: 2.5rem;
+  font-size: 0.65rem;
+  line-height: 1.25;
+  color: var(--text-secondary);
+}
+.eu-q-amt {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: baseline;
+  gap: 0.2rem;
+  min-height: 1.25rem;
+}
+.eu-q-amt-lbl {
+  font-weight: 700;
+  color: var(--text-primary);
+  min-width: 0.75rem;
+  text-align: right;
+}
+.eu-q-amt-val {
+  font-variant-numeric: tabular-nums;
+  word-break: break-all;
+}
+.eu-q-deviation {
+  margin-top: 0.35rem;
+  padding: 0.3rem 0.35rem;
+  border-radius: 6px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  line-height: 1.3;
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  border: 1px solid transparent;
+}
+.eu-q-deviation-label {
+  font-size: 0.6rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  opacity: 0.85;
+}
+.eu-q-deviation-val {
+  font-variant-numeric: tabular-nums;
+}
+.eu-q-deviation-flag {
+  font-size: 0.58rem;
+  font-weight: 700;
+}
+.eu-q-deviation.gap-severity-red {
+  background: rgba(220, 38, 38, 0.1);
+  border-color: rgba(220, 38, 38, 0.35);
+}
+.eu-q-deviation.gap-severity-yellow {
+  background: rgba(202, 138, 4, 0.12);
+  border-color: rgba(202, 138, 4, 0.35);
+}
+.eu-q-deviation.gap-severity-green {
+  background: rgba(22, 163, 74, 0.08);
+  border-color: rgba(22, 163, 74, 0.25);
+}
+.eu-q-meta {
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  margin-top: 0.35rem;
+}
+.eu-level-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+  max-height: 280px;
+  overflow-y: auto;
+}
+.eu-level-row {
+  font-size: 0.82rem;
+}
+.eu-level-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem 0.75rem;
+  margin-bottom: 0.2rem;
+}
+.eu-level-name {
+  font-weight: 600;
+  flex: 1;
+  min-width: 140px;
+}
+.eu-level-gap {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.eu-level-track {
+  height: 6px;
+  background: var(--bg-page);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.eu-level-fill {
+  height: 100%;
+  border-radius: 4px;
+  min-width: 2px;
+}
+.eu-level-fill.gap-severity-green {
+  background: #22c55e;
+}
+.eu-level-fill.gap-severity-yellow {
+  background: #eab308;
+}
+.eu-level-fill.gap-severity-red {
+  background: #ef4444;
+}
+.eu-level-fill.gap-severity-na {
+  background: var(--border);
+}
+.eu-alert-panel {
+  margin-bottom: 1rem;
+}
+.eu-alert-list {
+  margin: 0;
+  padding-left: 1.2rem;
+}
+.eu-alert-item {
+  margin-bottom: 0.5rem;
+  font-size: 0.875rem;
+  line-height: 1.45;
+}
+.eu-seg-panel {
+  border-color: rgba(202, 138, 4, 0.35);
+  background: rgba(254, 252, 232, 0.35);
+}
+.eu-seg-list {
+  margin: 0;
+  padding-left: 1.2rem;
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+
+.no-data-msg {
+  padding: 2rem 0;
+  text-align: center;
+  color: var(--text-secondary);
+  font-size: 0.95rem;
+}
+
+.gap-status-red { border-color: rgba(220, 38, 38, 0.5); background: rgba(254, 242, 242, 0.6); }
+.gap-status-yellow { border-color: rgba(202, 138, 4, 0.5); background: rgba(254, 252, 232, 0.6); }
+.gap-status-green { border-color: rgba(22, 163, 74, 0.35); }
+.gap-status-insufficient { opacity: 0.75; font-style: italic; }
+
+.result-source {
+  margin: 0 0 1rem;
+  font-size: 0.875rem;
+  color: var(--text-secondary);
+}
+
+.save-status {
+  margin: 0 0 1rem;
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+}
+
+.storico-status {
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+}
+
+.storico-empty {
+  color: var(--text-secondary);
+  font-size: 0.95rem;
+  padding: 2rem 0;
+  text-align: center;
+}
+
+.storico-table-wrap {
+  overflow-x: auto;
+  margin-bottom: 1.5rem;
+}
+
+.storico-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+}
+
+.storico-table th,
+.storico-table td {
+  padding: 0.65rem 0.75rem;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.storico-table th {
+  font-weight: 600;
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.storico-table tbody tr:hover {
+  background: rgba(10, 108, 210, 0.04);
+}
+
+.storico-url {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.storico-id {
+  font-family: monospace;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
+
+.storico-actions {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.btn-view {
+  background: none;
+  border: 1px solid var(--accent-blue);
+  color: var(--accent-blue);
+  padding: 0.3rem 0.7rem;
+  border-radius: 6px;
+  font-size: 0.8rem;
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+
+.btn-view:hover:not(:disabled) {
+  background: var(--accent-blue);
+  color: #fff;
+}
+
+.btn-view:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-delete {
+  background: none;
+  border: 1px solid #ef4444;
+  color: #ef4444;
+  padding: 0.3rem 0.7rem;
+  border-radius: 6px;
+  font-size: 0.8rem;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.btn-delete:hover:not(:disabled) {
+  background: #ef4444;
+  color: #fff;
+}
+
+.btn-delete:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.band-section {
+  margin-bottom: 1.25rem;
+}
+
+.band-title {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--primary);
+}
+
+.band-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem 1.5rem;
+  padding: 0.75rem 1rem;
+  background: var(--bg-card);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-soft);
+  font-size: 0.85rem;
+  margin-bottom: 0.5rem;
+  align-items: center;
+}
+
+.job-table {
+  width: 100%;
+  background: var(--bg-card);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-soft);
+  overflow-x: auto;
+}
+
+.job-row {
+  display: grid;
+  grid-template-columns: 2fr 0.6fr 1fr repeat(4, 0.7fr) 0.8fr 1.1fr 0.9fr 0.5fr;
+  gap: 0.5rem;
+  padding: 0.6rem 0.85rem;
+  border-bottom: 1px solid var(--border-light);
+  align-items: center;
+  font-size: 0.82rem;
+}
+
+.job-row.hay-row {
+  grid-template-columns: 1fr 1.35fr 0.72fr 0.72fr 0.65fr 1fr 1fr;
+}
+
+.job-row.ccnl-level-row {
+  grid-template-columns: 1.2fr 0.55fr 0.65fr 0.65fr 0.9fr 0.9fr 1fr 1fr 0.85fr;
+  font-size: 0.8125rem;
+}
+.ccnl-level-row--insufficient {
+  opacity: 0.88;
+}
+.ccnl-level-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  min-width: 0;
+}
+.ccnl-level-wrap {
+  margin-top: 0.5rem;
+}
+.ccnl-contract-row {
+  display: grid;
+  grid-column: 1 / -1;
+  padding: 0.55rem 0.65rem;
+  background: rgba(59, 130, 246, 0.06);
+  border-bottom: 1px solid var(--border-light, #e2e8f0);
+  cursor: pointer;
+}
+.ccnl-contract-label {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.35rem 0.75rem;
+  font-size: 0.9rem;
+}
+.ccnl-contract-meta {
+  font-size: 0.78rem;
+  font-weight: 500;
+}
+.job-row.ccnl-level-row.ccnl-level-row--nested {
+  background: rgba(248, 250, 252, 0.85);
+}
+.ccnl-level-detail--nested {
+  margin-left: 0.5rem;
+  border-left: 2px solid rgba(59, 130, 246, 0.2);
+}
+.ccnl-level-head {
+  margin-bottom: 1rem;
+}
+.ccnl-level-title {
+  margin: 0 0 0.35rem;
+  font-size: 1.05rem;
+}
+.ccnl-level-desc {
+  margin: 0 0 0.75rem;
+  font-size: 0.875rem;
+}
+.ccnl-status-badge {
+  display: inline-block;
+  font-size: 0.72rem;
+  font-weight: 700;
+  padding: 0.15rem 0.45rem;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+.ccnl-level-detail {
+  padding: 0.5rem 0.85rem 0.85rem;
+  background: var(--bg-page, #f8fafc);
+  border-bottom: 1px solid var(--border-light);
+}
+.ccnl-sample-note {
+  margin: 0 0 0.5rem;
+  font-size: 0.82rem;
+}
+.people-header.ccnl-person-header,
+.people-row.ccnl-person-row {
+  display: grid;
+  grid-template-columns: 2.5rem 1.2fr 3rem 1fr 1fr 1fr 7rem;
+  gap: 0.5rem;
+  align-items: center;
+  font-size: 0.8125rem;
+}
+.people-row.ccnl-person-row {
+  padding: 0.45rem 0;
+  border-bottom: 1px solid var(--border-light);
+}
+.people-row.ccnl-person-row:last-child {
+  border-bottom: none;
+}
+
+.cost-center-wrap {
+  margin-top: 0.5rem;
+}
+.cost-center-head {
+  margin-bottom: 1rem;
+}
+.cost-center-title {
+  margin: 0 0 0.35rem;
+  font-size: 1.05rem;
+}
+.cost-center-sub {
+  margin: 0 0 0.75rem;
+  font-size: 0.875rem;
+  line-height: 1.45;
+}
+.cost-center-hotspots {
+  margin-bottom: 1rem;
+}
+.cost-center-hotspots-empty {
+  margin: 0 0 1rem;
+  font-size: 0.875rem;
+}
+.cost-center-hotspot-list {
+  list-style: none;
+  margin: 0.5rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.cost-center-hotspot-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem 1rem;
+  padding: 0.55rem 0.75rem;
+  border-radius: 8px;
+  border: 1px solid var(--border-light);
+  background: var(--bg-card);
+  font-size: 0.875rem;
+}
+.cost-center-hotspot-rank {
+  font-weight: 700;
+  color: var(--text-secondary);
+  min-width: 1.5rem;
+}
+.cost-center-hotspot-name {
+  flex: 1 1 140px;
+}
+.cost-center-hotspot-gap {
+  font-weight: 600;
+}
+.cost-center-hotspot-weight {
+  font-size: 0.8rem;
+}
+.people-header.cost-center-person-header,
+.people-row.cost-center-person-row {
+  grid-template-columns: 2.5rem 1.1fr 3rem 1fr 0.75fr 1fr 1fr 7rem;
+}
+.subtab--integrative {
+  font-style: normal;
+}
+
+.job-row.clickable {
+  cursor: pointer;
+  transition: background 0.12s;
+}
+
+.job-row.clickable:hover {
+  background: rgba(10, 108, 210, 0.04);
+}
+
+.job-row.expanded {
+  background: rgba(10, 108, 210, 0.06);
+  border-bottom-color: transparent;
+}
+
+.expand-icon {
+  display: inline-block;
+  width: 1em;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  margin-right: 0.25rem;
+}
+
+.people-detail {
+  background: var(--bg-page);
+  border-bottom: 1px solid var(--border-light);
+  padding: 0.25rem 0.85rem 0.5rem 2.5rem;
+}
+
+.people-detail.hay-fascia-detail {
+  border-left: 3px solid var(--accent-blue, #2b86ed);
+  margin-left: 0.25rem;
+  padding-left: 1rem;
+}
+
+.hay-band-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.hay-band-alert-icon {
+  color: #dc2626;
+  flex: 0 0 auto;
+}
+
+.hay-band-gap-pill {
+  display: inline-block;
+  margin-left: 0.4rem;
+  padding: 0.08rem 0.4rem;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  color: var(--text-secondary);
+  background: rgba(148, 163, 184, 0.14);
+}
+
+.people-header,
+.people-row {
+  display: grid;
+  grid-template-columns: 0.3fr 1.5fr 1fr 1fr 1fr 1.2fr;
+  gap: 0.5rem;
+  padding: 0.35rem 0;
+  font-size: 0.78rem;
+  align-items: center;
+}
+
+.people-header {
+  color: var(--text-secondary);
+  font-weight: 600;
+  border-bottom: 1px solid var(--border-light);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.people-row {
+  border-bottom: 1px solid rgba(0, 0, 0, 0.04);
+}
+
+.people-row:last-child {
+  border-bottom: none;
+}
+
+.hay-role-header.jg-tr-score-grid,
+.hay-role-row.jg-tr-score-grid {
+  grid-template-columns:
+    minmax(10rem, 2.1fr)
+    minmax(3.2rem, 0.55fr)
+    repeat(4, minmax(5.25rem, 0.95fr))
+    minmax(3.5rem, 0.5fr)
+    minmax(7.5rem, 1.05fr)
+    minmax(1.15rem, 0.38fr)
+    minmax(4.2rem, 1fr);
+  gap: 0.25rem 0.35rem;
+  font-size: 0.72rem;
+}
+.jg-tr-col-head {
+  text-align: center;
+  line-height: 1.15;
+  white-space: normal;
+  font-size: 0.62rem;
+}
+.hay-role-header.jg-tr-score-grid .jg-tr-col-area {
+  white-space: normal;
+  hyphens: auto;
+  word-break: break-word;
+}
+.jg-tr-col-head-punteggio,
+.jg-tr-col-head-detail {
+  font-size: 0.58rem;
+  line-height: 1.2;
+}
+.jg-tr-detail-cell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+}
+.hay-role-row.jg-tr-score-grid .jg-tr-detail-cell {
+  white-space: normal;
+}
+.btn-jg-role-valuation {
+  font-size: 0.62rem;
+  padding: 0.22rem 0.5rem;
+  line-height: 1.25;
+  white-space: nowrap;
+  border: 1px solid rgba(10, 108, 210, 0.4);
+  border-radius: 6px;
+  background: #fff;
+  cursor: pointer;
+  color: var(--text-primary);
+  font-weight: 600;
+}
+.btn-jg-role-valuation:hover {
+  background: rgba(10, 108, 210, 0.1);
+}
+.jg-role-valuation-modal .jg-role-valuation-table-wrap {
+  max-height: min(70vh, 520px);
+  overflow: auto;
+  margin-bottom: 0.5rem;
+}
+.jg-role-valuation-missing {
+  margin: 0.5rem 0 1rem;
+}
+.jg-tr-score-cell {
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.jg-tr-p {
+  font-weight: 700;
+  color: var(--text-primary);
+}
+.jg-tr-p-100 {
+  white-space: nowrap;
+}
+.jg-tr-p100-suffix {
+  font-size: 0.78em;
+  font-weight: 600;
+  margin-left: 0.08rem;
+}
+.jg-rv-pt {
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.jg-rv-foot--sub td {
+  background: rgba(33, 82, 255, 0.035);
+  border-top: 1px solid var(--border-light);
+}
+.role-params-total--sub {
+  margin-top: 0.2rem;
+  margin-bottom: 0;
+  font-size: 0.86rem;
+}
+.role-params-formula {
+  font-size: 0.9em;
+}
+.jg-role-expand-block {
+  margin: 0.35rem 0 0.5rem 0.25rem;
+  padding-left: 0.5rem;
+  border-left: 3px solid rgba(33, 82, 255, 0.35);
+}
+.jg-role-valuation-panel {
+  background: #f8fafc;
+  border: 1px solid var(--border-light);
+  border-radius: 10px;
+  padding: 0.65rem 0.85rem 0.75rem;
+  margin-bottom: 0.65rem;
+}
+.jg-role-valuation-table-wrap {
+  overflow-x: auto;
+  border-radius: 8px;
+  border: 1px solid var(--border-light);
+  background: #fff;
+}
+.jg-role-valuation-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.74rem;
+  line-height: 1.35;
+}
+.jg-role-valuation-table th,
+.jg-role-valuation-table td {
+  border-bottom: 1px solid var(--border-light);
+  padding: 0.45rem 0.5rem;
+  vertical-align: top;
+  text-align: left;
+}
+.jg-role-valuation-table thead th {
+  background: rgba(10, 108, 210, 0.09);
+  font-weight: 700;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  color: var(--text-secondary);
+}
+.jg-role-valuation-table tbody tr:last-child td {
+  border-bottom: none;
+}
+.jg-rv-mac {
+  background: rgba(10, 108, 210, 0.05);
+  font-weight: 600;
+  min-width: 7.5rem;
+  width: 18%;
+}
+.jg-rv-fac {
+  min-width: 10rem;
+  width: 22%;
+}
+.jg-rv-w {
+  font-size: 0.72em;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-top: 0.2rem;
+  line-height: 1.3;
+}
+.jg-rv-score {
+  text-align: center;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  width: 4rem;
+  white-space: nowrap;
+}
+.jg-rv-input {
+  width: 3.25rem;
+  max-width: 100%;
+  padding: 0.28rem 0.35rem;
+  text-align: center;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.jg-role-valuation-edit-hint {
+  margin: 0 0 0.65rem;
+  font-size: 0.82rem;
+}
+.jg-rv-foot td {
+  background: rgba(33, 82, 255, 0.06);
+  border-top: 2px solid var(--border-light);
+  padding-top: 0.55rem;
+  padding-bottom: 0.55rem;
+}
+.jg-rv-foot-score {
+  font-variant-numeric: tabular-nums;
+}
+.jg-rv-foot-score strong {
+  font-size: 1rem;
+}
+.jg-rv-foot-hint {
+  display: block;
+  font-size: 0.68rem;
+  font-weight: 400;
+  margin-top: 0.2rem;
+}
+.jg-role-persons-after-table {
+  margin-top: 0.25rem;
+}
+.job-grading-tab-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.65rem;
+}
+.job-grading-tab-head__text {
+  flex: 1;
+  min-width: 14rem;
+  margin: 0;
+}
+.btn-jg-criteria {
+  flex-shrink: 0;
+  font: inherit;
+  font-size: 0.8rem;
+  font-weight: 600;
+  padding: 0.42rem 0.85rem;
+  border-radius: 8px;
+  border: 1px solid var(--border-light);
+  background: var(--bg-card);
+  color: #2152ff;
+  cursor: pointer;
+  box-shadow: var(--shadow-soft);
+}
+.btn-jg-criteria:hover {
+  background: rgba(33, 82, 255, 0.08);
+}
+.jg-criteria-modal {
+  background: var(--bg-card);
+  border: 1px solid var(--border-light);
+  border-radius: 12px;
+  padding: 1rem 1.15rem 1.1rem;
+  max-width: min(96vw, 1200px);
+  width: 100%;
+  max-height: 90vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.18);
+}
+.jg-criteria-modal h3 {
+  margin: 0 0 0.35rem;
+  font-size: 1.05rem;
+}
+.jg-criteria-intro {
+  margin: 0 0 0.65rem;
+  font-size: 0.82rem;
+  line-height: 1.4;
+}
+.jg-criteria-table-wrap {
+  overflow: auto;
+  flex: 1;
+  margin-bottom: 0.75rem;
+  border: 1px solid var(--border-light);
+  border-radius: 8px;
+}
+.jg-criteria-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.62rem;
+  line-height: 1.3;
+}
+.jg-criteria-table th,
+.jg-criteria-table td {
+  border: 1px solid var(--border-light);
+  padding: 0.35rem 0.4rem;
+  vertical-align: top;
+}
+.jg-criteria-table thead th {
+  background: rgba(10, 108, 210, 0.08);
+  font-weight: 700;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+.jg-mac-area {
+  background: rgba(10, 108, 210, 0.06);
+  font-weight: 600;
+  white-space: normal;
+  min-width: 5.5rem;
+}
+.jg-mac-w {
+  font-size: 0.75em;
+  font-weight: 700;
+  color: var(--text-secondary);
+  margin-top: 0.2rem;
+}
+.jg-crit-factor .jg-f-w {
+  display: block;
+  font-size: 0.75em;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-top: 0.15rem;
+}
+.jg-crit-desc {
+  max-width: 10rem;
+  color: var(--text-secondary);
+}
+.jg-crit-lvl {
+  min-width: 5.5rem;
+  max-width: 7.5rem;
+  font-size: 0.58rem;
+  line-height: 1.25;
+}
+.jg-criteria-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+.justify-modal--wide {
+  max-width: min(94vw, 44rem);
+}
+.role-params-grid--tr {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(13.5rem, 1fr));
+  gap: 0.5rem;
+  max-height: 52vh;
+  overflow-y: auto;
+  margin-bottom: 0.5rem;
+}
+
+.hay-person-header,
+.hay-person-row {
+  grid-template-columns: 0.4fr 1.5fr 0.9fr 1fr 1fr 1fr 1.15fr;
+}
+
+/* Blocco persone: sfondo bianco (stacca dal grigio/azzurro di .people-detail) */
+.people-detail.hay-person-detail {
+  background: #fff;
+  border: 1px solid var(--border-light);
+  border-radius: 8px;
+  padding: 0.4rem 0.65rem 0.55rem;
+  margin: 0.2rem 0 0.35rem;
+}
+
+.people-detail.hay-person-detail .hay-person-header {
+  background: #fff;
+  border-bottom-color: #e5e7eb;
+}
+
+.people-detail.hay-person-detail .hay-person-row {
+  background: #fff;
+  border-bottom: 1px solid #f0f0f0;
+}
+
+.people-detail.hay-person-detail .hay-person-row:hover {
+  background: #fafafa;
+}
+
+.hay-role-row span,
+.hay-person-row span,
+.hay-role-header span,
+.hay-person-header span {
+  white-space: nowrap;
+}
+
+.hay-role-row span:first-child,
+.hay-person-row span:nth-child(2),
+.hay-role-header span:first-child,
+.hay-person-header span:nth-child(2) {
+  white-space: normal;
+}
+
+.hay-seniority-cell {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.76rem;
+  color: var(--text-secondary);
+}
+.hay-person-deviation-head {
+  line-height: 1.2;
+  white-space: normal;
+}
+.hay-person-deviation-cell {
+  font-size: 0.76rem;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  color: var(--text-secondary);
+}
+
+.justify-seniority-box {
+  background: rgba(10, 108, 210, 0.06);
+  border-radius: var(--radius-sm);
+  padding: 0.5rem 0.65rem;
+  margin-bottom: 0.35rem;
+}
+
+.justify-person-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+  margin: 0 0 1rem;
+}
+.justify-metric-card {
+  background: rgba(10, 108, 210, 0.06);
+  border: 1px solid var(--border-light);
+  border-radius: 10px;
+  padding: 0.65rem 0.85rem;
+  font-size: 0.875rem;
+  line-height: 1.45;
+}
+.justify-metric-card--mock {
+  background: rgba(234, 179, 8, 0.08);
+  border-color: rgba(202, 138, 4, 0.35);
+}
+.justify-metric-title {
+  font-weight: 700;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--text-secondary);
+  margin-bottom: 0.4rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.justify-mock-badge {
+  font-weight: 600;
+  font-size: 0.65rem;
+  text-transform: none;
+  letter-spacing: 0;
+  background: rgba(202, 138, 4, 0.2);
+  color: #92400e;
+  padding: 0.15rem 0.45rem;
+  border-radius: 999px;
+}
+.justify-metric-line {
+  margin: 0.25rem 0 0;
+}
+.justify-metric-pct {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  margin-left: 0.25rem;
+}
+.justify-metric-ref {
+  display: block;
+  margin-top: 0.2rem;
+  font-size: 0.78rem;
+}
+.justify-metric-note {
+  margin: 0.45rem 0 0;
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
+.person-justify-file-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+.person-justify-textarea-block {
+  margin: 0;
+}
+.person-justify-textarea-with-upload {
+  display: flex;
+  gap: 0.5rem;
+  align-items: flex-start;
+}
+.person-justify-textarea-field {
+  flex: 1;
+  min-width: 0;
+}
+.person-justify-textarea-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  flex-shrink: 0;
+  padding-top: 0.15rem;
+}
+.person-justify-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border: 1px solid var(--border-light);
+  border-radius: 50%;
+  background: var(--bg-page);
+  color: var(--accent-blue, #2563eb);
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.person-justify-icon-btn:hover,
+.person-justify-icon-btn:focus-visible {
+  background: rgba(37, 99, 235, 0.08);
+  border-color: rgba(37, 99, 235, 0.35);
+}
+@media (max-width: 520px) {
+  .person-justify-textarea-with-upload {
+    flex-direction: column;
+  }
+  .person-justify-textarea-actions {
+    flex-direction: row;
+    align-items: center;
+    padding-top: 0;
+  }
+}
+.justify-doc-info-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+.justify-info-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border: 1px solid var(--border-light);
+  border-radius: 50%;
+  background: var(--bg-page);
+  color: var(--accent-blue, #2563eb);
+  cursor: help;
+  transition: background 0.15s, border-color 0.15s;
+}
+.justify-info-trigger:hover,
+.justify-info-trigger:focus-visible {
+  background: rgba(37, 99, 235, 0.08);
+  border-color: var(--accent-blue, #2563eb);
+  outline: none;
+}
+.justify-doc-tooltip {
+  display: none;
+  position: absolute;
+  z-index: 50;
+  left: 0;
+  bottom: calc(100% + 8px);
+  width: min(22rem, calc(100vw - 3rem));
+  max-height: min(70vh, 24rem);
+  overflow-y: auto;
+  padding: 0.75rem 0.9rem;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  color: var(--text-primary);
+  background: var(--bg-card);
+  border: 1px solid var(--border-light);
+  border-radius: 10px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.12);
+  text-align: left;
+}
+.justify-doc-tooltip::after {
+  content: '';
+  position: absolute;
+  left: 14px;
+  bottom: -6px;
+  width: 10px;
+  height: 10px;
+  background: var(--bg-card);
+  border-right: 1px solid var(--border-light);
+  border-bottom: 1px solid var(--border-light);
+  transform: rotate(45deg);
+}
+.justify-doc-info-wrap:hover .justify-doc-tooltip,
+.justify-doc-info-wrap:focus-within .justify-doc-tooltip {
+  display: block;
+}
+.justify-doc-tooltip-title {
+  margin: 0 0 0.5rem;
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+}
+.justify-doc-tooltip-p {
+  margin: 0 0 0.5rem;
+}
+.justify-doc-tooltip-p:last-child {
+  margin-bottom: 0;
+}
+
+.inline-icon {
+  display: inline-block;
+  vertical-align: -2px;
+  margin-right: 0.25rem;
+  color: var(--text-secondary);
+}
+
+.inline-icon.gender-male {
+  color: #2563eb;
+}
+
+.inline-icon.gender-female {
+  color: #db2777;
+}
+
+.inline-icon.gender-unknown {
+  color: #64748b;
+}
+
+.role-cell-main {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.role-params-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+  margin: 0.75rem 0 0.5rem;
+}
+
+.role-param-field {
+  display: grid;
+  gap: 0.3rem;
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+}
+
+.role-params-total {
+  margin: 0.25rem 0 0.5rem;
+  font-size: 0.85rem;
+}
+
+.score-input {
+  width: 100%;
+  max-width: 72px;
+  padding: 0.3rem 0.4rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 0.82rem;
+  text-align: center;
+  color: var(--text-primary);
+  background: var(--bg-card);
+  transition: border-color 0.15s;
+}
+
+.score-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(10, 108, 210, 0.15);
+}
+
+.gap-alert {
+  color: #dc2626;
+  font-weight: 700;
+}
+
+.indicator-value.gap-alert {
+  background: rgba(220, 38, 38, 0.08);
+  border-radius: var(--radius-sm);
+  padding: 0.15rem 0.4rem;
+}
+
+.job-row.header {
+  background: var(--bg-page);
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.url-input-wrap {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 0.5rem;
+}
+.upload-alt-divider {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin: 0.3rem 0 0.45rem;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+}
+.upload-alt-divider::before,
+.upload-alt-divider::after {
+  content: '';
+  height: 1px;
+  flex: 1;
+  background: var(--border-light);
+}
+
+.url-input {
+  flex: 1;
+  min-width: 280px;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 0.9375rem;
+  color: var(--text-primary);
+  background: var(--bg-card);
+}
+
+.url-input:focus {
+  outline: none;
+  border-color: var(--accent-blue);
+  box-shadow: 0 0 0 2px rgba(10, 108, 210, 0.2);
+}
+
+.url-input::placeholder {
+  color: var(--text-muted);
+}
+
+.url-input:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+
+.header-row-option {
+  margin-bottom: 1rem;
+}
+
+.header-row-option label {
+  display: block;
+  font-size: 0.875rem;
+  color: var(--text-primary);
+  margin-bottom: 0.35rem;
+}
+
+.header-row-select {
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 0.875rem;
+  background: var(--bg-card);
+  color: var(--text-primary);
+  margin-right: 0.5rem;
+}
+
+.header-row-hint {
+  font-size: 0.8125rem;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+.api-key-warn {
+  margin: 0 0 0.75rem;
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+  line-height: 1.4;
+}
+
+.url-hint {
+  margin: 0 0 1rem;
+  font-size: 0.8125rem;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+.upload-zone {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 160px;
+  padding: 2rem;
+  background: var(--bg-card);
+  border: 2px dashed var(--border);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s;
+  color: var(--text-secondary);
+  font-size: 0.9375rem;
+}
+
+.upload-zone:hover {
+  border-color: var(--accent-blue);
+  background: rgba(10, 108, 210, 0.04);
+  color: var(--accent-blue);
+}
+
+.upload-zone.loading {
+  pointer-events: none;
+  opacity: 0.8;
+}
+
+.upload-error {
+  margin: 1rem 0 0;
+  color: #c53030;
+  font-size: 0.875rem;
+}
+
+.upload-info {
+  margin: 1rem 0 0;
+  padding: 0.65rem 0.85rem;
+  border-radius: 8px;
+  border: 1px solid rgba(37, 99, 235, 0.25);
+  background: rgba(59, 130, 246, 0.06);
+  color: #1e40af;
+  font-size: 0.875rem;
+  line-height: 1.45;
+}
+
+.mapping-section {
+  margin-bottom: 1.25rem;
+}
+.mapping-section-title {
+  margin: 0 0 0.5rem;
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+.mapping-field-label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  min-width: 0;
+}
+.mapping-field-name {
+  font-weight: 500;
+  line-height: 1.35;
+}
+.mapping-hint {
+  font-size: 0.78rem;
+  font-weight: 400;
+  color: var(--text-secondary);
+  line-height: 1.35;
+}
+.mapping-row--unmapped-required {
+  background: rgba(254, 242, 242, 0.5);
+}
+.mapping-row--unmapped-recommended {
+  background: rgba(254, 252, 232, 0.35);
+}
+.mapping-error {
+  margin: 0 0 0.75rem;
+  padding: 0.65rem 0.85rem;
+  border-radius: 8px;
+  background: rgba(254, 242, 242, 0.95);
+  border: 1px solid rgba(220, 38, 38, 0.25);
+  color: #991b1b;
+  font-size: 0.875rem;
+}
+.mapping-warn {
+  margin: 0 0 0.75rem;
+  padding: 0.65rem 0.85rem;
+  border-radius: 8px;
+  background: rgba(254, 252, 232, 0.95);
+  border: 1px solid rgba(202, 138, 4, 0.3);
+  color: #854d0e;
+  font-size: 0.875rem;
+}
+
+.mapping-table {
+  background: var(--bg-card);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-soft);
+  overflow: hidden;
+  margin-bottom: 1rem;
+}
+
+.mapping-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+  align-items: center;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border-light);
+}
+
+.mapping-row:last-child {
+  border-bottom: none;
+}
+
+.mapping-row.header {
+  background: var(--bg-page);
+  font-weight: 600;
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+}
+
+.mapping-select {
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 0.875rem;
+  background: white;
+  color: var(--text-primary);
+}
+
+.mapping-actions {
+  display: flex;
+  gap: 0.75rem;
+  margin-top: 1.25rem;
+}
+
+.analysis-loader {
+  margin-top: 1rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6rem;
+  font-size: 0.875rem;
+  color: var(--text-secondary);
+}
+
+.spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent-blue);
+  border-radius: 50%;
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.results .indicator-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 1.25rem;
+  margin-bottom: 1.5rem;
+}
+
+.indicator-card {
+  background: var(--bg-card);
+  border-radius: var(--radius-md);
+  padding: 1.25rem;
+  box-shadow: var(--shadow-card);
+}
+
+.indicator-card.wide {
+  grid-column: 1 / -1;
+}
+
+.indicator-card h3 {
+  margin: 0 0 0.35rem;
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.indicator-desc {
+  margin: 0 0 0.75rem;
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+  line-height: 1.4;
+}
+
+.indicator-value {
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: var(--accent-blue);
+  margin-bottom: 0.5rem;
+}
+
+.indicator-detail {
+  margin: 0.25rem 0 0;
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+}
+
+.indicator-row {
+  display: flex;
+  gap: 2rem;
+  flex-wrap: wrap;
+}
+
+.indicator-row .muted {
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+}
+
+.quartile-table,
+.category-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+}
+
+.quartile-row,
+.category-row {
+  display: grid;
+  grid-template-columns: 80px 1fr 1fr 1fr;
+  gap: 0.5rem;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid var(--border-light);
+}
+
+.category-row {
+  grid-template-columns: 1fr 60px 1fr 1fr;
+}
+
+.quartile-row.header,
+.category-row.header {
+  font-weight: 600;
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border);
+}
+
+/* Pulsante giustificativo persona (testo esplicito) */
+.hay-person-justify-cell {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+}
+
+.hay-person-no-justify {
+  font-size: 0.78rem;
+}
+
+.btn-justify-person {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.4rem 0.65rem;
+  border: 1px solid rgba(22, 163, 74, 0.35);
+  border-radius: 6px;
+  background: rgba(22, 163, 74, 0.08);
+  color: #166534;
+  font-size: 0.72rem;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+}
+
+.btn-justify-person svg {
+  flex-shrink: 0;
+  opacity: 0.75;
+}
+
+.btn-justify-person:hover {
+  background: rgba(22, 163, 74, 0.16);
+  border-color: #16a34a;
+  color: #15803d;
+}
+
+.btn-justify-person:hover svg {
+  opacity: 1;
+}
+
+.btn-justify-person.has-note {
+  background: rgba(22, 163, 74, 0.2);
+  border-color: #16a34a;
+  color: #14532d;
+}
+
+.btn-pay-communication {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.35rem 0.55rem;
+  border: 1px solid rgba(10, 108, 210, 0.35);
+  border-radius: 6px;
+  background: rgba(10, 108, 210, 0.08);
+  color: #0a4d8c;
+  font-size: 0.68rem;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+}
+
+.btn-pay-communication svg {
+  flex-shrink: 0;
+  opacity: 0.8;
+}
+
+.btn-pay-communication:hover:not(:disabled) {
+  background: rgba(10, 108, 210, 0.16);
+  border-color: #0a6cd2;
+  color: #084a8a;
+}
+
+.btn-pay-communication:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.btn-pay-communication--profile {
+  font-size: 0.82rem;
+  padding: 0.5rem 0.85rem;
+}
+
+.justify-actions-spacer {
+  flex: 1;
+}
+
+/* Modal giustificativo */
+.justify-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 200;
+}
+
+.justify-modal {
+  background: var(--bg-card);
+  border-radius: var(--radius-md);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.2);
+  padding: 1.75rem 2rem;
+  width: 90%;
+  max-width: 520px;
+  max-height: min(92vh, 900px);
+  overflow-y: auto;
+}
+
+.justify-modal-person {
+  max-width: 640px;
+}
+
+.justify-modal h3 {
+  margin: 0 0 0.5rem;
+  font-size: 1.1rem;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.justify-hint {
+  margin: 0 0 1rem;
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+  line-height: 1.45;
+}
+
+.justify-textarea {
+  width: 100%;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 0.875rem;
+  font-family: inherit;
+  color: var(--text-primary);
+  background: var(--bg-page);
+  resize: vertical;
+  box-sizing: border-box;
+}
+
+.justify-textarea:focus {
+  outline: none;
+  border-color: var(--accent-blue);
+  box-shadow: 0 0 0 2px rgba(10, 108, 210, 0.2);
+}
+
+.justify-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 1rem;
+}
+
+.person-justify-textarea-label {
+  display: block;
+  margin: 0 0 0.35rem;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+.spinner-sm {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(10, 108, 210, 0.2);
+  border-top-color: var(--primary, #0a6cd2);
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+}
+
+/* Analysis Settings Panel */
+.settings-panel {
+  background: var(--bg-card);
+  border-radius: var(--radius-md);
+  padding: 1.25rem 1.5rem;
+  box-shadow: var(--shadow-soft);
+  margin: 1.5rem 0;
+  border: 1px solid var(--border-light);
+}
+
+.settings-title {
+  margin: 0 0 1rem;
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.settings-row {
+  margin-bottom: 1.25rem;
+}
+
+.settings-row:last-child {
+  margin-bottom: 0;
+}
+
+.settings-hint {
+  margin: 0 0 0.5rem;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+.weights-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 0.75rem;
+}
+
+.weight-field label {
+  display: block;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  margin-bottom: 0.3rem;
+  font-weight: 500;
+}
+
+.weight-input-wrap {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.weight-pct {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.weights-total {
+  margin: 0.6rem 0 0;
+  font-size: 0.825rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.weights-error {
+  color: #dc2626;
+}
+
+/* Warning row for >25% deviation */
+.row-warning {
+  background: rgba(245, 158, 11, 0.08) !important;
+  border-left: 3px solid #f59e0b;
+}
+.job-family-cell {
+  font-size: 0.82rem;
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+.multiplier-badge {
+  background: var(--primary);
+  color: #fff;
+  font-size: 0.68rem;
+  padding: 0.1rem 0.35rem;
+  border-radius: 8px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.level-tag {
+  background: var(--bg-page);
+  border: 1px solid var(--border-light);
+  color: var(--text-secondary);
+  font-size: 0.7rem;
+  padding: 0.08rem 0.35rem;
+  border-radius: 6px;
+  font-weight: 600;
+  margin-left: 0.2rem;
+}
+.weights-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  flex-wrap: wrap;
+  background: var(--bg-card);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-md);
+  padding: 0.6rem 1rem;
+  margin-bottom: 1.2rem;
+  box-shadow: var(--shadow-soft);
+}
+.weights-bar-label {
+  font-weight: 600;
+  font-size: 0.85rem;
+  color: var(--text-primary);
+}
+.wb-field {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  white-space: nowrap;
+}
+.wb-input {
+  width: 48px;
+  padding: 0.2rem 0.3rem;
+  border: 1px solid var(--border-light);
+  border-radius: 6px;
+  text-align: center;
+  font-size: 0.8rem;
+  background: var(--bg-page);
+}
+.wb-input:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px rgba(10, 108, 210, 0.12);
+}
+.wb-total {
+  font-weight: 700;
+  font-size: 0.85rem;
+  color: var(--text-primary);
+}
+.btn-sm {
+  padding: 0.3rem 0.85rem;
+  font-size: 0.8rem;
+  border-radius: 6px;
+}
+
+/* Gender dashboard toggle */
+.gender-dashboard-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 1.5rem 0 1rem;
+  padding: 0.75rem 1rem;
+  background: var(--bg-card);
+  border-radius: 10px;
+  box-shadow: var(--shadow-soft);
+  flex-wrap: wrap;
+}
+.toggle-label {
+  font-weight: 600;
+  font-size: 0.9rem;
+  color: var(--text-primary);
+  margin-right: 0.25rem;
+}
+.toggle-btn {
+  padding: 0.35rem 1rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #1f2937;
+  cursor: pointer;
+  font-size: 0.85rem;
+  font-weight: 600;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+  transition: all 0.15s;
+}
+.toggle-btn:hover {
+  background: #f8fafc;
+  border-color: #94a3b8;
+}
+.toggle-btn.active {
+  background: #2563eb;
+  color: #fff;
+  border-color: #2563eb;
+  font-weight: 600;
+}
+.eu-compliant-msg {
+  color: #16a34a;
+  font-weight: 600;
+  font-size: 0.85rem;
+  margin-left: 0.5rem;
+  padding: 0.25rem 0.75rem;
+  background: rgba(22, 163, 74, 0.08);
+  border-radius: 6px;
+}
+
+/* Band gender gap table */
+.band-gender-section {
+  margin-top: 1rem;
+}
+.band-gender-table {
+  display: grid;
+  gap: 0;
+  font-size: 0.85rem;
+}
+.band-gender-row {
+  display: grid;
+  grid-template-columns: 60px 80px 80px 120px 110px 1fr;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  align-items: center;
+  border-bottom: 1px solid var(--border-light);
+}
+.band-gender-row.header {
+  font-weight: 700;
+  background: var(--bg-page);
+  border-radius: 6px 6px 0 0;
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+.band-gender-row.gap-over {
+  background: rgba(239, 68, 68, 0.05);
+}
+.band-gender-row.gap-ok {
+  background: rgba(22, 163, 74, 0.04);
+}
+.gap-value {
+  font-weight: 600;
+}
+.status-badge {
+  display: inline-block;
+  padding: 0.15rem 0.5rem;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+.status-badge.compliant {
+  background: rgba(22, 163, 74, 0.12);
+  color: #16a34a;
+}
+.status-badge.non-compliant {
+  background: rgba(239, 68, 68, 0.12);
+  color: #ef4444;
+}
+.btn-justify-open {
+  font-size: 0.78rem;
+  padding: 0.25rem 0.6rem;
+  border: 1px dashed var(--border-light);
+  border-radius: 6px;
+  background: var(--bg-page);
+  cursor: pointer;
+  color: var(--primary);
+  font-weight: 500;
+  transition: all 0.15s;
+}
+.btn-justify-open:hover {
+  border-color: var(--primary);
+  background: rgba(10, 108, 210, 0.05);
+}
+.band-justify-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.78rem;
+  color: var(--text-primary);
+  cursor: pointer;
+  padding: 0.2rem 0.5rem;
+  background: rgba(10, 108, 210, 0.06);
+  border-radius: 5px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.band-justify-summary:hover { background: rgba(10, 108, 210, 0.1); }
+.btn-link-sm {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  padding: 0;
+}
+.btn-link-sm:hover { color: #ef4444; }
+
+/* Justification panel */
+.band-justify-panel {
+  grid-column: 1 / -1;
+  background: var(--bg-card);
+  border: 1px solid var(--border-light);
+  border-radius: 10px;
+  padding: 1rem 1.25rem;
+  margin: 0.25rem 0 0.5rem;
+  box-shadow: var(--shadow-soft);
+}
+.bjp-header {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+.bjp-header strong { font-size: 0.9rem; }
+.bjp-reasons {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+.bjp-reason-btn {
+  display: grid;
+  grid-template-columns: 28px 1fr 22px;
+  grid-template-rows: auto auto;
+  gap: 0 0.4rem;
+  padding: 0.6rem 0.75rem;
+  border: 1.5px solid var(--border-light);
+  border-radius: 8px;
+  background: var(--bg-page);
+  cursor: pointer;
+  text-align: left;
+  transition: all 0.15s;
+}
+.bjp-reason-btn:hover {
+  border-color: var(--primary);
+  background: rgba(10, 108, 210, 0.03);
+}
+.bjp-reason-btn.active {
+  border-color: var(--primary);
+  background: rgba(10, 108, 210, 0.08);
+  box-shadow: 0 0 0 2px rgba(10, 108, 210, 0.12);
+}
+.bjp-reason-icon {
+  grid-row: 1 / 3;
+  font-size: 1.2rem;
+  align-self: center;
+}
+.bjp-reason-label {
+  font-weight: 600;
+  font-size: 0.82rem;
+  color: var(--text-primary);
+}
+.bjp-reason-desc {
+  grid-column: 2;
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  line-height: 1.3;
+}
+.bjp-reason-check {
+  grid-row: 1 / 3;
+  align-self: center;
+  justify-self: center;
+  font-size: 0.9rem;
+  color: var(--primary);
+  font-weight: 700;
+}
+.bjp-note { margin-bottom: 0.75rem; }
+.bjp-note-label {
+  display: block;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 0.3rem;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+.bjp-note-input {
+  width: 100%;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--border-light);
+  border-radius: 6px;
+  font-size: 0.82rem;
+  background: var(--bg-page);
+  resize: vertical;
+  font-family: inherit;
+}
+.bjp-note-input:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px rgba(10, 108, 210, 0.12);
+}
+.bjp-files { margin-bottom: 0.75rem; }
+.bjp-file-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin-bottom: 0.5rem;
+}
+.bjp-file-item {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.3rem 0.5rem;
+  background: var(--bg-page);
+  border-radius: 5px;
+  font-size: 0.8rem;
+  border: 1px solid var(--border-light);
+}
+.bjp-file-icon { font-size: 0.9rem; }
+.bjp-file-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+.bjp-file-size {
+  color: var(--text-secondary);
+  font-size: 0.72rem;
+}
+.bjp-upload-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.35rem 0.75rem;
+  border: 1px dashed var(--border-light);
+  border-radius: 6px;
+  background: var(--bg-page);
+  cursor: pointer;
+  font-size: 0.8rem;
+  color: var(--primary);
+  font-weight: 500;
+  transition: all 0.15s;
+}
+.bjp-upload-btn:hover {
+  border-color: var(--primary);
+  background: rgba(10, 108, 210, 0.05);
+}
+.bjp-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+}
+
+/* Adjusted gap section */
+.adjusted-gap-section {
+  margin-top: 1rem;
+}
+.adjusted-gap-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 1rem;
+  margin-top: 0.75rem;
+}
+.adjusted-gap-box {
+  text-align: center;
+  padding: 0.75rem;
+  background: var(--bg-page);
+  border-radius: 8px;
+  border: 1px solid var(--border-light);
+}
+.adjusted-gap-label {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  margin-bottom: 0.25rem;
+}
+.indicator-value.plain {
+  color: var(--text-primary);
+  font-size: 1.5rem;
+}
+.adjusted-gap-note {
+  margin-top: 0.75rem;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.results-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.history-save-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex: 1 1 16rem;
+  justify-content: flex-end;
+  min-width: 0;
+}
+
+.history-save-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin-top: 0.65rem;
+}
+
+.history-save-field--inline {
+  margin-top: 0;
+  flex: 1 1 12rem;
+  max-width: 22rem;
+}
+
+.history-save-name {
+  width: 100%;
+  min-width: 0;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.results-head .analisi-title {
+  margin-bottom: 0;
+}
+
+.insights-subtabs {
+  margin: 0.5rem 0 1.25rem;
+}
+
+.hist-kpis {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 1.25rem;
+}
+
+.hist-kpi {
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 0.85rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.hist-kpi strong {
+  font-size: 1.15rem;
+}
+
+.hist-kpi-label,
+.hist-kpi-delta,
+.hist-note,
+.hist-n {
+  color: var(--text-secondary);
+  font-size: 0.78rem;
+}
+
+.hist-heading {
+  margin: 1.25rem 0 0.4rem;
+  font-size: 1rem;
+}
+
+.hist-note {
+  margin: 0 0 0.75rem;
+  line-height: 1.45;
+}
+
+.hist-gap-chart {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.75rem;
+  overflow-x: auto;
+  padding: 0.75rem 0.25rem 0.25rem;
+  margin-bottom: 0.5rem;
+}
+
+.hist-gap-col {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  min-width: 92px;
+  gap: 0.3rem;
+}
+
+.hist-gap-bar {
+  width: 28px;
+  border-radius: 6px 6px 2px 2px;
+  background: #94a3b8;
+}
+
+.hist-gap-bar.gap-severity-green { background: #16a34a; }
+.hist-gap-bar.gap-severity-yellow { background: #ca8a04; }
+.hist-gap-bar.gap-severity-red { background: #dc2626; }
+
+.hist-gap-val {
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.hist-gap-date {
+  font-size: 0.68rem;
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+.sim-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 0.75rem 1rem;
+  margin-bottom: 1rem;
+}
+
+.sim-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.sim-field .url-input {
+  width: 100%;
+}
+
+.sim-actions {
+  display: flex;
+  align-items: flex-end;
+}
+
+.sim-level-title {
+  margin: 1rem 0 0.25rem;
+  font-size: 0.95rem;
+}
+
+.sim-row-changed {
+  background: rgba(10, 108, 210, 0.06);
+}
+
+.hist-n {
+  display: block;
+  font-weight: 500;
+}
+</style>
