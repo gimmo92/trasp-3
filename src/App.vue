@@ -1,5 +1,5 @@
 ﻿<script setup>
-import { ref, computed, onMounted, nextTick } from 'vue'
+import { ref, computed, watch, onMounted, nextTick } from 'vue'
 import {
   parseExcelFromUrl,
   parseExcelFromFile,
@@ -15,6 +15,7 @@ import {
 import { isTeaTracciato } from './lib/column-mapping.js'
 import { teaPayComposition } from './lib/teaTracciato.js'
 import { groupByTeaBand } from './lib/teaBands.js'
+import { buildRoleRows, cdrLabel, roleGapMagnitude, roleRangeText } from './lib/roleAnalysis.js'
 import { computeIndicators, computeBandGenderGaps, computeAdjustedGap } from './lib/indicators.js'
 import { computeIndicatorsWithGemini } from './lib/gemini.js'
 import {
@@ -607,6 +608,9 @@ const hasCostCenterColumn = computed(() =>
 )
 const hasTeaBandData = computed(() =>
   genderNormalizedCache.value.some((r) => String(r.payBand ?? '').trim()),
+)
+const hasJobCodeData = computed(() =>
+  genderNormalizedCache.value.some((r) => String(r.jobCode ?? '').trim()),
 )
 const hasCostCenterData = computed(() =>
   genderNormalizedForAnalysis.value.some((r) => String(r.category ?? '').trim()),
@@ -1791,6 +1795,140 @@ const genderNormalizedForAnalysis = computed(() =>
 const teaBandRows = computed(() => groupByTeaBand(genderNormalizedForAnalysis.value))
 const expandedTeaBands = ref(new Set())
 
+const roleQualification = ref('')
+const roleCdr = ref('')
+const roleSort = ref({ key: 'gap', dir: 'desc' })
+const expandedRoleCode = ref(null)
+
+const roleQualificationOptions = computed(() => {
+  const values = new Set()
+  for (const person of genderNormalizedForAnalysis.value) {
+    const name = String(person.qualification ?? '').trim()
+    if (name) values.add(name)
+  }
+  return [...values].sort((a, b) => a.localeCompare(b, 'it'))
+})
+
+const roleCdrOptions = computed(() => {
+  const values = new Set()
+  for (const person of genderNormalizedForAnalysis.value) {
+    const name = cdrLabel(person)
+    if (name) values.add(name)
+  }
+  return [...values].sort((a, b) => a.localeCompare(b, 'it'))
+})
+
+watch(roleQualificationOptions, (options) => {
+  if (roleQualification.value && !options.includes(roleQualification.value)) roleQualification.value = ''
+})
+watch(roleCdrOptions, (options) => {
+  if (roleCdr.value && !options.includes(roleCdr.value)) roleCdr.value = ''
+})
+
+const roleSourcePeople = computed(() =>
+  genderNormalizedForAnalysis.value.filter((person) => {
+    if (roleQualification.value && String(person.qualification ?? '').trim() !== roleQualification.value) return false
+    if (roleCdr.value && cdrLabel(person) !== roleCdr.value) return false
+    return true
+  }),
+)
+
+const roleRows = computed(() => {
+  const rows = buildRoleRows(roleSourcePeople.value, { thresholdPct: EU_GAP_THRESHOLD_PCT })
+  const { key, dir } = roleSort.value
+  const sign = dir === 'asc' ? 1 : -1
+  const valueOf = (row) => {
+    if (key === 'code') return row.code
+    if (key === 'description') return row.description
+    if (key === 'n') return row.n
+    if (key === 'median') return row.median
+    if (key === 'gapMean') return roleGapMagnitude({ gapMean: row.gapMean, gapMedian: null })
+    if (key === 'gapMedian') return roleGapMagnitude({ gapMean: null, gapMedian: row.gapMedian })
+    return roleGapMagnitude(row)
+  }
+  return rows.slice().sort((a, b) => {
+    const left = valueOf(a)
+    const right = valueOf(b)
+    const leftMissing = left == null || left === ''
+    const rightMissing = right == null || right === ''
+    if (leftMissing && rightMissing) return a.code.localeCompare(b.code, 'it')
+    if (leftMissing) return 1
+    if (rightMissing) return -1
+    if (typeof left === 'string' || typeof right === 'string') {
+      return String(left).localeCompare(String(right), 'it') * sign
+    }
+    return (left - right) * sign || a.code.localeCompare(b.code, 'it')
+  })
+})
+
+function toggleRoleSort(key) {
+  if (roleSort.value.key === key) {
+    roleSort.value = { key, dir: roleSort.value.dir === 'desc' ? 'asc' : 'desc' }
+  } else {
+    roleSort.value = { key, dir: key === 'code' || key === 'description' ? 'asc' : 'desc' }
+  }
+}
+
+function roleSortMark(key) {
+  if (roleSort.value.key !== key) return ''
+  return roleSort.value.dir === 'asc' ? ' ↑' : ' ↓'
+}
+
+function toggleMansione(code) {
+  expandedRoleCode.value = expandedRoleCode.value === code ? null : code
+}
+
+function roleDotLayout(row) {
+  const placed = (row?.people || []).filter((person) => person.ralFte != null)
+  if (!placed.length) return null
+  const min = row.min
+  const max = row.max
+  const span = max - min || 1
+  const xOf = (salary) => 36 + ((salary - min) / span) * 560
+  const lane = (gender, index) => (gender === 'F' ? 46 : 96) + ((index % 3) - 1) * 7
+  let woman = 0
+  let man = 0
+  const dots = placed.map((person) => {
+    const index = person.gender === 'F' ? woman++ : man++
+    return {
+      key: `${person.index}`,
+      x: xOf(person.ralFte),
+      y: lane(person.gender, index),
+      gender: person.gender,
+      label: `${employeeCode(person)} · ${person.name || '–'} · ${formatNum(person.ralFte)}`,
+    }
+  })
+  return {
+    dots,
+    medianX: xOf(row.median),
+    minLabel: formatNum(min),
+    maxLabel: formatNum(max),
+    medianLabel: formatNum(row.median),
+  }
+}
+
+function roleStackScale(row) {
+  const totals = [row.avgFixedM, row.avgVarM, row.avgFixedF, row.avgVarF]
+    .map((fixed, index, all) => (index % 2 === 0 ? (fixed || 0) + (all[index + 1] || 0) : 0))
+  return Math.max(...totals, 1)
+}
+
+function exportRoleRange(row) {
+  const text = roleRangeText(row, {
+    company: selectedCompany.value ? companyScopeLabel.value : 'Tutte le società',
+    qualification: roleQualification.value,
+    cdr: roleCdr.value,
+  })
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  const safeCode = String(row.code || 'ruolo').replace(/[^\w.-]+/g, '_')
+  link.href = url
+  link.download = `fascia-retributiva-${safeCode}.txt`
+  link.click()
+  URL.revokeObjectURL(url)
+}
+
 function toggleTeaBand(band) {
   const next = new Set(expandedTeaBands.value)
   if (next.has(band)) next.delete(band)
@@ -2322,6 +2460,15 @@ onMounted(async () => {
             @click="resultsTab = 'tea_band'"
           >
             Analisi per fascia
+          </button>
+          <button
+            type="button"
+            class="subtab"
+            :class="{ active: resultsTab === 'role' }"
+            :disabled="!hasJobCodeData"
+            @click="resultsTab = 'role'"
+          >
+            Analisi per ruolo
           </button>
           <button
             type="button"
@@ -2917,6 +3064,175 @@ onMounted(async () => {
           </div>
           <p v-else-if="selectedCompany" class="no-data-msg">Nessuna banda per la società selezionata.</p>
           <p v-else class="no-data-msg">Nessuna banda nel tracciato. Verifica la colonna Banda.</p>
+        </div>
+
+        <div v-show="resultsTab === 'role'" class="role-analysis">
+          <CompanyFilter
+            v-if="showCompanyFilter"
+            v-model="selectedCompany"
+            :options="companyOptions"
+            :count="roleSourcePeople.length"
+          />
+          <div class="role-analysis-head">
+            <h3 class="band-title">Analisi per ruolo</h3>
+            <p class="muted band-summary">
+              Un ruolo è un codice mansione. La RAL è annua, normalizzata solo sul part-time.
+              Il gap è (retribuzione uomini − retribuzione donne) / retribuzione uomini.
+              In rosso i ruoli con gap oltre il {{ EU_GAP_THRESHOLD_PCT }}%.
+            </p>
+            <div class="role-extra-filters">
+              <label>
+                <span>Qualifica</span>
+                <select v-model="roleQualification" class="company-filter-select">
+                  <option value="">Tutte le qualifiche</option>
+                  <option v-for="name in roleQualificationOptions" :key="name" :value="name">{{ name }}</option>
+                </select>
+              </label>
+              <label>
+                <span>CdR</span>
+                <select v-model="roleCdr" class="company-filter-select">
+                  <option value="">Tutti i CdR</option>
+                  <option v-for="name in roleCdrOptions" :key="name" :value="name">{{ name }}</option>
+                </select>
+              </label>
+            </div>
+          </div>
+          <div v-if="roleRows.length" class="role-table-wrap">
+            <table class="role-table">
+              <thead>
+                <tr>
+                  <th><button type="button" @click="toggleRoleSort('code')">Codice{{ roleSortMark('code') }}</button></th>
+                  <th><button type="button" @click="toggleRoleSort('description')">Descrizione{{ roleSortMark('description') }}</button></th>
+                  <th class="num"><button type="button" @click="toggleRoleSort('n')">N{{ roleSortMark('n') }}</button></th>
+                  <th class="num">F</th>
+                  <th class="num">M</th>
+                  <th class="num"><button type="button" @click="toggleRoleSort('median')">Mediana{{ roleSortMark('median') }}</button></th>
+                  <th class="num">Min</th>
+                  <th class="num">Max</th>
+                  <th class="num"><button type="button" @click="toggleRoleSort('gapMean')">Gap media{{ roleSortMark('gapMean') }}</button></th>
+                  <th class="num"><button type="button" @click="toggleRoleSort('gapMedian')">Gap mediana{{ roleSortMark('gapMedian') }}</button></th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                <template v-for="row in roleRows" :key="'role-' + row.code">
+                  <tr
+                    class="role-summary-row"
+                    :class="{ 'role-summary-row--open': expandedRoleCode === row.code, 'role-summary-row--alert': row.overThreshold }"
+                    @click="toggleMansione(row.code)"
+                  >
+                    <td class="emp-id">{{ expandedRoleCode === row.code ? '▾' : '▸' }} {{ row.code }}</td>
+                    <td>
+                      {{ row.description }}
+                      <small v-if="row.titles.length > 1" class="muted">{{ row.titles.length }} descrizioni</small>
+                    </td>
+                    <td class="num">{{ row.n }}</td>
+                    <td class="num">{{ row.nF }}</td>
+                    <td class="num">{{ row.nM }}</td>
+                    <td class="num">{{ formatNum(row.median) }}</td>
+                    <td class="num">{{ formatNum(row.min) }}</td>
+                    <td class="num">{{ formatNum(row.max) }}</td>
+                    <td class="num" :class="{ 'role-gap-hot': row.gapMean != null && Math.abs(row.gapMean) > EU_GAP_THRESHOLD_PCT }">{{ formatGapMforF(row.gapMean) }}</td>
+                    <td class="num" :class="{ 'role-gap-hot': row.gapMedian != null && Math.abs(row.gapMedian) > EU_GAP_THRESHOLD_PCT }">{{ formatGapMforF(row.gapMedian) }}</td>
+                    <td>
+                      <span v-if="row.overThreshold" class="role-alert" title="Gap oltre la soglia">Oltre soglia</span>
+                    </td>
+                  </tr>
+                  <tr v-if="expandedRoleCode === row.code" class="role-detail-row">
+                    <td colspan="11">
+                      <div class="role-detail">
+                        <div class="role-detail-top">
+                          <div>
+                            <h4>{{ row.code }} · {{ row.description }}</h4>
+                            <p v-if="row.titles.length > 1" class="muted">Descrizioni nel codice: {{ row.titles.join(' · ') }}</p>
+                            <p v-if="row.nM < 3 || row.nF < 3" class="muted">Campione ridotto per un genere: il gap va letto con cautela.</p>
+                          </div>
+                          <div class="role-range-card">
+                            <span>Fascia per annuncio · RAL annua FTE</span>
+                            <strong>{{ formatNum(row.min) }} – {{ formatNum(row.max) }} €</strong>
+                            <small>Mediana {{ formatNum(row.median) }} €</small>
+                            <button type="button" class="btn-secondary" @click.stop="exportRoleRange(row)">Esporta fascia</button>
+                          </div>
+                        </div>
+
+                        <div class="role-detail-grid">
+                          <section>
+                            <h5>Distribuzione RAL FTE</h5>
+                            <svg v-if="roleDotLayout(row)" class="role-dots" viewBox="0 0 640 140" role="img" :aria-label="'Distribuzione RAL del ruolo ' + row.code">
+                              <line x1="36" y1="118" x2="596" y2="118" class="role-axis" />
+                              <line :x1="roleDotLayout(row).medianX" y1="24" :x2="roleDotLayout(row).medianX" y2="112" class="role-median-line" />
+                              <text x="36" y="134" class="role-axis-label">{{ roleDotLayout(row).minLabel }}</text>
+                              <text :x="roleDotLayout(row).medianX" y="16" text-anchor="middle" class="role-axis-label">mediana</text>
+                              <text x="596" y="134" text-anchor="end" class="role-axis-label">{{ roleDotLayout(row).maxLabel }}</text>
+                              <text x="8" y="50" class="role-axis-label">F</text>
+                              <text x="8" y="100" class="role-axis-label">M</text>
+                              <circle
+                                v-for="dot in roleDotLayout(row).dots"
+                                :key="dot.key"
+                                :cx="dot.x"
+                                :cy="dot.y"
+                                r="5.5"
+                                :class="dot.gender === 'F' ? 'role-dot-f' : 'role-dot-m'"
+                              >
+                                <title>{{ dot.label }}</title>
+                              </circle>
+                            </svg>
+                            <p v-else class="muted">Nessuna RAL valida in questo ruolo.</p>
+                          </section>
+                          <section>
+                            <h5>Fisso e variabile</h5>
+                            <p class="muted">Media della RAL FTE e della parte variabile annua erogata. Le voci mensili non sono sommate.</p>
+                            <div v-for="lane in [{ key: 'F', label: 'Donne', fixed: row.avgFixedF, variable: row.avgVarF }, { key: 'M', label: 'Uomini', fixed: row.avgFixedM, variable: row.avgVarM }]" :key="lane.key" class="role-stack-row">
+                              <span>{{ lane.label }}</span>
+                              <div class="role-stack-track">
+                                <i class="role-stack-fixed" :style="{ width: ((lane.fixed || 0) / roleStackScale(row) * 100) + '%' }"></i>
+                                <i class="role-stack-var" :style="{ width: ((lane.variable || 0) / roleStackScale(row) * 100) + '%' }"></i>
+                              </div>
+                              <small>RAL {{ formatNum(lane.fixed) }} · var. {{ formatNum(lane.variable) }}</small>
+                            </div>
+                          </section>
+                        </div>
+
+                        <h5>Dipendenti</h5>
+                        <div class="role-table-wrap">
+                          <table class="role-table role-people-table">
+                            <thead>
+                              <tr>
+                                <th>ID</th>
+                                <th>Nome</th>
+                                <th>Sesso</th>
+                                <th class="num">RAL FTE</th>
+                                <th class="num">Scost. mediana</th>
+                                <th>Grade</th>
+                                <th>Livello CCNL</th>
+                                <th>Anzianità</th>
+                                <th>Valutazione</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              <tr v-for="person in row.people" :key="'rp-' + row.code + '-' + person.index">
+                                <td class="emp-id">{{ employeeCode(person) }}</td>
+                                <td>{{ person.name || '–' }}</td>
+                                <td>{{ person.gender || '–' }}</td>
+                                <td class="num">{{ formatNum(person.ralFte) }}</td>
+                                <td class="num">{{ person.deviationPct == null ? '–' : (person.deviationPct > 0 ? '+' : '') + person.deviationPct.toFixed(1) + '%' }}</td>
+                                <td>{{ person.grade || '–' }}</td>
+                                <td>{{ person.level || '–' }}</td>
+                                <td>{{ person.seniorityYears == null ? '–' : person.seniorityYears.toLocaleString('it-IT', { maximumFractionDigits: 1 }) + ' anni' }}</td>
+                                <td>{{ person.performanceOnFive == null ? '–' : person.performanceOnFive.toLocaleString('it-IT', { maximumFractionDigits: 1 }) + '/5' }}</td>
+                              </tr>
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+          <p v-else-if="selectedCompany || roleQualification || roleCdr" class="no-data-msg">Nessun ruolo per i filtri selezionati.</p>
+          <p v-else class="no-data-msg">Nessun codice mansione nel tracciato.</p>
         </div>
 
         <div v-show="resultsTab === 'job_grading'">
@@ -4514,6 +4830,7 @@ onMounted(async () => {
 
 .results-subtabs {
   display: flex;
+  flex-wrap: wrap;
   gap: 0;
   margin-bottom: 1.25rem;
   border-bottom: 1px solid var(--border-light);
@@ -5394,6 +5711,188 @@ onMounted(async () => {
   white-space: nowrap;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.78rem;
+}
+
+.role-extra-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.85rem 1.25rem;
+  margin: 0.35rem 0 0.9rem;
+}
+.role-extra-filters label {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+.role-extra-filters select {
+  min-width: 14rem;
+  padding: 0.45rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm, 8px);
+  font-size: 0.9rem;
+  font-weight: 500;
+  color: var(--text-primary);
+  background: var(--bg-card, #fff);
+}
+.role-table-wrap {
+  overflow-x: auto;
+}
+.role-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+}
+.role-table th,
+.role-table td {
+  padding: 0.45rem 0.5rem;
+  border-bottom: 1px solid var(--border-light, #e5e7eb);
+  text-align: left;
+  vertical-align: top;
+}
+.role-table th {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.role-table th button {
+  border: 0;
+  background: none;
+  padding: 0;
+  font: inherit;
+  font-weight: 700;
+  color: inherit;
+  cursor: pointer;
+}
+.role-table .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.role-summary-row {
+  cursor: pointer;
+}
+.role-summary-row:hover {
+  background: #f8fafc;
+}
+.role-summary-row--open {
+  background: #f8fafc;
+}
+.role-summary-row--alert td:first-child {
+  box-shadow: inset 3px 0 0 #dc2626;
+}
+.role-gap-hot {
+  color: #b91c1c;
+  font-weight: 700;
+}
+.role-alert {
+  display: inline-block;
+  padding: 0.12rem 0.4rem;
+  border-radius: 999px;
+  background: #fee2e2;
+  color: #b91c1c;
+  font-size: 0.72rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.role-detail {
+  padding: 0.75rem 0.35rem 1rem;
+}
+.role-detail-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+  align-items: flex-start;
+}
+.role-detail h4,
+.role-detail h5 {
+  margin: 0 0 0.35rem;
+}
+.role-range-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  min-width: 16rem;
+  padding: 0.7rem 0.85rem;
+  border: 1px solid var(--border-light, #e5e7eb);
+  border-radius: 10px;
+  background: #fff;
+}
+.role-range-card span,
+.role-range-card small {
+  color: var(--text-secondary);
+}
+.role-range-card button {
+  margin-top: 0.35rem;
+  align-self: flex-start;
+}
+.role-detail-grid {
+  display: grid;
+  grid-template-columns: minmax(18rem, 1.4fr) minmax(16rem, 1fr);
+  gap: 1.25rem;
+  margin: 0.85rem 0 1rem;
+}
+.role-dots {
+  width: 100%;
+  height: auto;
+  background: #fff;
+  border: 1px solid var(--border-light, #e5e7eb);
+  border-radius: 8px;
+}
+.role-axis {
+  stroke: #cbd5e1;
+  stroke-width: 1;
+}
+.role-median-line {
+  stroke: #64748b;
+  stroke-dasharray: 3 3;
+  stroke-width: 1;
+}
+.role-axis-label {
+  fill: #64748b;
+  font-size: 11px;
+}
+.role-dot-f {
+  fill: #db2777;
+}
+.role-dot-m {
+  fill: #2563eb;
+}
+.role-stack-row {
+  display: grid;
+  grid-template-columns: 4.5rem 1fr;
+  gap: 0.2rem 0.6rem;
+  align-items: center;
+  margin-bottom: 0.55rem;
+}
+.role-stack-row small {
+  grid-column: 2;
+  color: var(--text-secondary);
+}
+.role-stack-track {
+  display: flex;
+  height: 14px;
+  background: #f1f5f9;
+  border-radius: 999px;
+  overflow: hidden;
+}
+.role-stack-fixed {
+  background: #0f766e;
+}
+.role-stack-var {
+  background: #f59e0b;
+}
+.role-people-table {
+  margin-top: 0.35rem;
+}
+@media (max-width: 900px) {
+  .role-detail-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 .job-row.ccnl-level-row {
