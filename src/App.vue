@@ -82,6 +82,7 @@ import {
   DEFAULT_PAY_CRITERIA_TEXT,
 } from './lib/payCommunicationPayload.js'
 import SalaryReview from './components/SalaryReview.vue'
+import CompanyFilter from './components/CompanyFilter.vue'
 import { peopleFromJobResults } from './lib/salaryReview.js'
 
 const activeSection = ref('analisi')
@@ -169,11 +170,37 @@ const indicatorsResult = ref(null)
 const indicatorsSource = ref('locale')
 
 const jobResults = ref([])
-const jobFasce = computed(() => jobGradingFasce(jobResults.value))
-const reviewSourcePeople = computed(() => peopleFromJobResults(jobResults.value))
 
 /** Override punteggi 0–100 per ruolo: chiave `${livelloCCNL}|${nomeRuolo}` → { factorId: number } */
 const transparencyRoleOverrides = ref({})
+
+const COMPANY_UNSPECIFIED = '__unspecified__'
+const selectedCompany = ref('')
+
+function companyKeyOf(person) {
+  const name = person?.company != null ? String(person.company).trim() : ''
+  return name || COMPANY_UNSPECIFIED
+}
+
+function personMatchesCompany(person) {
+  if (!selectedCompany.value) return true
+  return companyKeyOf(person) === selectedCompany.value
+}
+
+const analysisJobResults = computed(() => {
+  if (!selectedCompany.value) return jobResults.value
+  const people = []
+  for (const band of jobResults.value || []) {
+    for (const person of band.people || []) {
+      if (personMatchesCompany(person)) people.push(person)
+    }
+  }
+  if (!people.length) return []
+  return enrichWithDeviation(groupByLevel(people, transparencyRoleOverrides.value))
+})
+
+const jobFasce = computed(() => jobGradingFasce(analysisJobResults.value))
+const reviewSourcePeople = computed(() => peopleFromJobResults(analysisJobResults.value))
 const jobGradingCriteriaModalOpen = ref(false)
 /** Popup scheda punteggi fattori per ruolo: { level, subLabel, roleName } */
 const roleValuationModal = ref(null)
@@ -345,6 +372,7 @@ async function viewAnalysis(id) {
     if (canRebuild) {
       runJobGrading()
       const normalizedGender = buildNormalizedData(excelRows.value, excelHeaders.value, columnMapping.value)
+      selectedCompany.value = ''
       genderNormalizedCache.value = normalizedGender
       indicatorsResult.value = normalizedGender.length
         ? computeIndicators(normalizedGender, { metric: euDashboardMetric.value })
@@ -354,6 +382,7 @@ async function viewAnalysis(id) {
       indicatorsResult.value = results.gender || null
       indicatorsSource.value = (record.calculation_source || '').includes('gender:ai') ? 'ai' : 'locale'
       jobResults.value = results.jobGrading || []
+      selectedCompany.value = ''
       genderNormalizedCache.value = []
     }
     bandGenderJustifications.value = {}
@@ -400,7 +429,7 @@ const simError = ref('')
 
 const simLevelOptions = computed(() => {
   const set = new Set()
-  for (const band of jobResults.value || []) {
+  for (const band of analysisJobResults.value || []) {
     if (band?.level) set.add(String(band.level))
   }
   return [...set]
@@ -473,8 +502,13 @@ function runHireSimulation() {
       mapping: columnMapping.value,
       overrides: transparencyRoleOverrides.value,
     })
+    const scoped = people.filter((person) => personMatchesCompany(person))
+    if (!scoped.length) {
+      simError.value = 'Nessun dipendente per la società selezionata.'
+      return
+    }
     simResult.value = simulateHire({
-      people,
+      people: scoped,
       overrides: transparencyRoleOverrides.value,
       form: { ...simForm.value },
     })
@@ -568,6 +602,12 @@ const hasMultipleCcnls = computed(() => ccnlGroups.value.length > 1)
 
 const ccnlLevelRows = computed(() => flattenCcnlLevelRows(ccnlGroups.value))
 
+const hasCostCenterColumn = computed(() =>
+  genderNormalizedCache.value.some((r) => String(r.category ?? '').trim()),
+)
+const hasTeaBandData = computed(() =>
+  genderNormalizedCache.value.some((r) => String(r.payBand ?? '').trim()),
+)
 const hasCostCenterData = computed(() =>
   genderNormalizedForAnalysis.value.some((r) => String(r.category ?? '').trim()),
 )
@@ -643,7 +683,7 @@ function formatDeviationVsGenderGroupMean(person) {
 
 function resolveCcnlLabel() {
   const counts = new Map()
-  for (const r of genderNormalizedCache.value || []) {
+  for (const r of genderNormalizedForAnalysis.value || []) {
     const c = r?.ccnl != null ? String(r.ccnl).trim() : ''
     if (!c) continue
     counts.set(c, (counts.get(c) || 0) + 1)
@@ -1007,6 +1047,7 @@ function startNuovaAnalisi() {
   justifications.value = {}
   justifyingLevel.value = null
   genderViewMode.value = 'media'
+  selectedCompany.value = ''
   genderNormalizedCache.value = []
   quartileOutlierJustifications.value = {}
   transparencyRoleOverrides.value = {}
@@ -1173,6 +1214,7 @@ async function confirmMapping() {
     }
 
     // Gender gap per band & gap rettificato
+    selectedCompany.value = ''
     genderNormalizedCache.value = normalizedGender
     bandGenderJustifications.value = {}
     quartileOutlierJustifications.value = {}
@@ -1721,9 +1763,29 @@ const justifyingTeaPay = computed(() => {
   return teaPayComposition(full)
 })
 /** Dataset genere dopo esclusione dipendenti con giustificativo (outlier quartile o persona CCNL/fascia/CdC) */
+const companyOptions = computed(() => {
+  const named = new Set()
+  let unspecified = false
+  for (const person of genderNormalizedCache.value) {
+    const name = person?.company != null ? String(person.company).trim() : ''
+    if (name) named.add(name)
+    else unspecified = true
+  }
+  const options = [...named]
+    .sort((a, b) => a.localeCompare(b, 'it'))
+    .map((name) => ({ value: name, label: name }))
+  if (unspecified && named.size) options.push({ value: COMPANY_UNSPECIFIED, label: 'Non indicata' })
+  return options
+})
+const showCompanyFilter = computed(() => companyOptions.value.length > 0)
+const companyScopeLabel = computed(() => {
+  if (!selectedCompany.value) return 'azienda'
+  return companyOptions.value.find((opt) => opt.value === selectedCompany.value)?.label || 'società'
+})
+
 const genderNormalizedForAnalysis = computed(() =>
   genderNormalizedCache.value.filter(
-    (r) => !isQuartileAnalysisExcluded(r.index) && !isPersonJustified(r),
+    (r) => personMatchesCompany(r) && !isQuartileAnalysisExcluded(r.index) && !isPersonJustified(r),
   ),
 )
 const teaBandRows = computed(() => groupByTeaBand(genderNormalizedForAnalysis.value))
@@ -1737,7 +1799,7 @@ function toggleTeaBand(band) {
 }
 
 const bandGenderGaps = computed(() =>
-  computeBandGenderGaps(genderNormalizedForAnalysis.value, jobResults.value),
+  computeBandGenderGaps(genderNormalizedForAnalysis.value, analysisJobResults.value),
 )
 const adjustedGapResult = computed(() =>
   computeAdjustedGap(genderNormalizedForAnalysis.value, 5),
@@ -1749,7 +1811,7 @@ const expandedJustifyBand = ref(null)
 const euDashboard = computed(() =>
   computeEuGenderDashboard(
     genderNormalizedForAnalysis.value,
-    jobResults.value,
+    analysisJobResults.value,
     euDashboardMetric.value,
   ),
 )
@@ -2256,7 +2318,7 @@ onMounted(async () => {
             type="button"
             class="subtab"
             :class="{ active: resultsTab === 'tea_band' }"
-            :disabled="teaBandRows.length === 0"
+            :disabled="!hasTeaBandData"
             @click="resultsTab = 'tea_band'"
           >
             Analisi per fascia
@@ -2265,7 +2327,7 @@ onMounted(async () => {
             type="button"
             class="subtab subtab--integrative"
             :class="{ active: resultsTab === 'cost_center' }"
-            :disabled="!hasCostCenterData"
+            :disabled="!hasCostCenterColumn"
             @click="resultsTab = 'cost_center'"
           >
             Analisi per centro di costo
@@ -2283,8 +2345,17 @@ onMounted(async () => {
 
         <!-- Global Gender Pay Transparency Dashboard — Direttiva UE 2023/970 -->
         <div v-show="resultsTab === 'eu_dashboard'" class="eu-dashboard-wrap">
+          <CompanyFilter
+            v-if="showCompanyFilter"
+            v-model="selectedCompany"
+            :options="companyOptions"
+            :count="genderNormalizedForAnalysis.length"
+          />
           <div v-if="genderNormalizedCache.length === 0" class="no-data-msg">
             Per la <strong>Global Gender Pay Transparency Dashboard</strong> (Direttiva UE 2023/970) è necessario mappare la colonna <strong>Genere</strong> e avere dipendenti con valori M/F nel file.
+          </div>
+          <div v-else-if="selectedCompany && !genderNormalizedForAnalysis.length" class="no-data-msg">
+            Nessun dipendente per la società selezionata.
           </div>
           <template v-else>
             <div class="eu-dash-header">
@@ -2313,11 +2384,11 @@ onMounted(async () => {
 
             <div class="eu-kpi-grid">
               <div class="eu-kpi-card">
-                <div class="eu-kpi-label">Gender pay gap medio (azienda)</div>
+                <div class="eu-kpi-label">Gender pay gap medio ({{ companyScopeLabel }})</div>
                 <div class="eu-kpi-value" :class="euGapSeverityClass(euDashboard.gapMean)">{{ formatGapMforF(euDashboard.gapMean) }}</div>
               </div>
               <div class="eu-kpi-card">
-                <div class="eu-kpi-label">Gender pay gap mediano (azienda)</div>
+                <div class="eu-kpi-label">Gender pay gap mediano ({{ companyScopeLabel }})</div>
                 <div class="eu-kpi-value" :class="euGapSeverityClass(euDashboard.gapMedian)">{{ formatGapMforF(euDashboard.gapMedian) }}</div>
               </div>
               <div class="eu-kpi-card eu-kpi-span">
@@ -2626,7 +2697,13 @@ onMounted(async () => {
 
         <!-- Confronto per livello CCNL (reporting normativo) -->
         <div v-show="resultsTab === 'ccnl_level'" class="ccnl-level-wrap">
-          <template v-if="jobResults.length > 0">
+          <CompanyFilter
+            v-if="showCompanyFilter"
+            v-model="selectedCompany"
+            :options="companyOptions"
+            :count="genderNormalizedForAnalysis.length"
+          />
+          <template v-if="analysisJobResults.length > 0">
             <div class="ccnl-level-head">
               <h3 class="ccnl-level-title">Confronto retributivo per livello CCNL</h3>
               <p class="ccnl-level-desc muted">
@@ -2779,10 +2856,17 @@ onMounted(async () => {
               </template>
             </div>
           </template>
+          <p v-else-if="selectedCompany" class="no-data-msg">Nessun dipendente per la società selezionata.</p>
           <p v-else class="no-data-msg">Nessun livello CCNL disponibile. Verifica il mapping del file.</p>
         </div>
 
         <div v-show="resultsTab === 'tea_band'" class="band-section">
+          <CompanyFilter
+            v-if="showCompanyFilter"
+            v-model="selectedCompany"
+            :options="companyOptions"
+            :count="genderNormalizedForAnalysis.length"
+          />
           <h3 class="band-title">Fasce del tracciato</h3>
           <p class="muted band-summary">Banda e Grade sono i numeri del file. La RAL media è quella annua, normalizzata solo sulla percentuale di part-time.</p>
           <div v-if="teaBandRows.length" class="job-table">
@@ -2831,11 +2915,18 @@ onMounted(async () => {
               </div>
             </template>
           </div>
+          <p v-else-if="selectedCompany" class="no-data-msg">Nessuna banda per la società selezionata.</p>
           <p v-else class="no-data-msg">Nessuna banda nel tracciato. Verifica la colonna Banda.</p>
         </div>
 
         <div v-show="resultsTab === 'job_grading'">
-          <template v-if="jobResults.length > 0">
+          <CompanyFilter
+            v-if="showCompanyFilter"
+            v-model="selectedCompany"
+            :options="companyOptions"
+            :count="genderNormalizedForAnalysis.length"
+          />
+          <template v-if="analysisJobResults.length > 0">
           <div class="job-grading-tab-head">
             <button type="button" class="btn-jg-criteria" @click="jobGradingCriteriaModalOpen = true">Info analisi</button>
           </div>
@@ -3008,6 +3099,7 @@ onMounted(async () => {
             </div>
           </div>
           </template>
+          <div v-else-if="selectedCompany" class="no-data-msg">Nessun dipendente per la società selezionata.</div>
           <div v-else class="no-data-msg">
             Dati job grading non disponibili. Verifica il mapping e riesegui l'analisi.
           </div>
@@ -3015,6 +3107,12 @@ onMounted(async () => {
 
         <!-- Analisi per centro di costo (gestionale, non normativa) -->
         <div v-show="resultsTab === 'cost_center'" class="cost-center-wrap">
+          <CompanyFilter
+            v-if="showCompanyFilter"
+            v-model="selectedCompany"
+            :options="companyOptions"
+            :count="genderNormalizedForAnalysis.length"
+          />
           <template v-if="hasCostCenterData">
             <div class="cost-center-head">
               <h3 class="cost-center-title">Analisi per centro di costo</h3>
@@ -3164,6 +3262,8 @@ onMounted(async () => {
               </template>
             </div>
           </template>
+          <p v-else-if="selectedCompany && !genderNormalizedForAnalysis.length" class="no-data-msg">Nessun dipendente per la società selezionata.</p>
+          <p v-else-if="selectedCompany" class="no-data-msg">Nessun centro di costo per la società selezionata.</p>
           <p v-else class="no-data-msg">
             Mappa la colonna <strong>Categoria / centro di costo</strong> nel file Excel per abilitare questa analisi organizzativa.
           </p>
@@ -3175,6 +3275,12 @@ onMounted(async () => {
           class="person-justify-tab-panel"
         >
           <template v-if="justifyingPerson">
+            <CompanyFilter
+              v-if="showCompanyFilter"
+              v-model="selectedCompany"
+              :options="companyOptions"
+              :count="genderNormalizedForAnalysis.length"
+            />
             <h2 class="person-justify-tab-title">
               Inserisci giustificativo per {{ justifyingPerson.displayName }}
             </h2>
@@ -3671,6 +3777,12 @@ onMounted(async () => {
         </div>
 
         <div v-else class="sim-pane">
+          <CompanyFilter
+            v-if="showCompanyFilter"
+            v-model="selectedCompany"
+            :options="companyOptions"
+            :count="genderNormalizedForAnalysis.length"
+          />
           <p class="hist-note">
             Il calcolo aggiunge un dipendente ipotetico ai dati dell’analisi aperta. La fascia è quella del ruolo (punteggio di grading). Le medie sono sulla retribuzione totale annua, come nel job grading.
           </p>
@@ -4003,11 +4115,18 @@ onMounted(async () => {
     </template>
     </div>
     </template>
-    <SalaryReview
-      v-else-if="activeSideItem === 'compensation-salary-review'"
-      :source-people="reviewSourcePeople"
-      :company-name="reportCompanyName"
-    />
+    <div v-else-if="activeSideItem === 'compensation-salary-review'" class="sr-company-scope">
+      <CompanyFilter
+        v-if="showCompanyFilter"
+        v-model="selectedCompany"
+        :options="companyOptions"
+        :count="genderNormalizedForAnalysis.length"
+      />
+      <SalaryReview
+        :source-people="reviewSourcePeople"
+        :company-name="reportCompanyName"
+      />
+    </div>
     <div v-else class="section-placeholder">
       <h2 class="analisi-title">{{ activeSideLabel }}</h2>
       <p class="analisi-desc">Questa sezione non è disponibile in questa vista.</p>
@@ -4190,6 +4309,14 @@ onMounted(async () => {
   background: transparent;
 }
 
+.sr-company-scope {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 0.85rem 1.25rem 0;
+}
 .section-placeholder {
   padding: 2.5rem 2rem;
 }
