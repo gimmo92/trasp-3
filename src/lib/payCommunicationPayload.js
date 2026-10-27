@@ -169,6 +169,7 @@ export function buildPayCommunicationPayload({
     minSample,
     employee: {
       index: person.index,
+      employeeId: person.employeeId != null && String(person.employeeId).trim() !== '' ? String(person.employeeId).trim() : '',
       name: person.name && String(person.name).trim() ? String(person.name).trim() : `#${person.index}`,
       gender: person.gender,
       levelLabel,

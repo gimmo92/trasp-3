@@ -13,7 +13,8 @@ export function collectPersonJustifications(people, personJustifications = {}) {
     const text = sanitizeText(personJustifications[key])
     if (!text) continue
     const name = p?.name && String(p.name).trim() ? String(p.name).trim() : `#${key}`
-    parts.push(`${name}: ${text}`)
+    const id = p?.employeeId != null && String(p.employeeId).trim() !== '' ? String(p.employeeId).trim() : ''
+    parts.push(`${id ? `${id} · ` : ''}${name}: ${text}`)
   }
   return parts.join('\n\n')
 }

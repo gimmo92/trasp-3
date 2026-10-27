@@ -27,7 +27,7 @@ function drawPageChrome(doc, payload) {
   doc.setFont('helvetica', 'normal')
   doc.setFontSize(7.5)
   doc.setTextColor(80, 80, 80)
-  doc.text(`${payload.companyName || 'Azienda'} · ${emp.name || '–'}`, MARGIN, 10)
+  doc.text(`${payload.companyName || 'Azienda'} · ${emp.employeeId ? emp.employeeId + ' · ' : ''}${emp.name || '–'}`, MARGIN, 10)
   doc.text(`Generato: ${payload.generatedAtLabel || '–'}`, pageWidth - MARGIN, 10, {
     align: 'right',
   })
@@ -91,6 +91,7 @@ function drawHeader(doc, payload) {
   const rows = [
     ['Ragione sociale datore di lavoro', payload.companyName || '–'],
     ['Data di generazione', payload.generatedAtLabel || '–'],
+    ['ID dipendente', emp.employeeId || '–'],
     ['Richiedente', emp.name || '–'],
     ['Livello di inquadramento CCNL', emp.levelLabel || '–'],
     ['CCNL applicato', emp.ccnlLabel || '–'],

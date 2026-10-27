@@ -125,6 +125,7 @@ function deviationShifts(beforeHay, afterHay, newIndex) {
     if (!Number.isFinite(beforeDev) || !Number.isFinite(afterDev)) continue
     shifts.push({
       index: p.index,
+      employeeId: p.employeeId ?? null,
       name: p.name || `Dipendente ${p.index}`,
       role: p.role || '–',
       gender: p.gender || '–',

@@ -811,6 +811,7 @@ function downloadCsv() {
                   <tr v-for="row in evaluations[card.id].rows" :key="row.person.id" :class="{ locked: row.elig.blocking }">
                     <td>
                       <strong>{{ row.person.name }}</strong>
+                      <small v-if="row.person.employeeId" class="emp-id">{{ row.person.employeeId }}</small>
                       <small>{{ row.person.role }} · {{ row.person.level }}</small>
                       <small v-for="flag in row.elig.flags" :key="flag.code" :class="flag.blocking ? 'is-bad' : 'is-wait'">
                         {{ flag.label }}
@@ -942,6 +943,7 @@ function downloadCsv() {
             <table class="sr-table">
               <thead>
                 <tr>
+                  <th>ID</th>
                   <th>Persona</th>
                   <th>Manager</th>
                   <th>Leva</th>
@@ -953,6 +955,7 @@ function downloadCsv() {
               </thead>
               <tbody>
                 <tr v-for="row in letters" :key="row.id">
+                  <td class="emp-id">{{ row.employeeId || '–' }}</td>
                   <td>
                     <strong>{{ row.name }}</strong>
                     <small>{{ row.role }} · {{ row.level }}<template v-if="row.lever === 'promotion'"> → {{ row.newLevel }}</template></small>
@@ -1241,6 +1244,12 @@ function downloadCsv() {
 .sr-table td strong,
 .sr-table td small {
   display: block;
+}
+.emp-id {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.78rem;
 }
 
 .sr-name {

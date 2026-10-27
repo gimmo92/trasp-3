@@ -1217,6 +1217,16 @@ function formatGapMforF(gap, hasJustification = false) {
   return `${lead}${body}`
 }
 function formatNum(n) { return n == null ? '–' : Number(n).toLocaleString('it-IT', { maximumFractionDigits: 2 }) }
+function employeeCode(person) {
+  const id = person?.employeeId
+  if (id == null || String(id).trim() === '') return '–'
+  return String(id).trim()
+}
+function personLabel(person, fallback) {
+  const name = person?.name && String(person.name).trim() ? String(person.name).trim() : fallback
+  const id = employeeCode(person)
+  return id === '–' ? name : `${id} · ${name}`
+}
 
 /** Altezza barra quartili in px (evita % errate nei flex item) */
 const EU_QUARTILE_BAR_TRACK_PX = 100
@@ -1373,10 +1383,7 @@ function openCcnlPersonJustify(person, levelRow) {
       ? ((performanceScore - levelAvgPerformance) / levelAvgPerformance) * 100
       : null
 
-  const displayName =
-    person?.name && String(person.name).trim()
-      ? String(person.name).trim()
-      : `Dipendente #${key}`
+  const displayName = personLabel(person, `Dipendente #${key}`)
   const gapPct = levelRow.gapMean
   const jgCtx = findJobGradingContextByIndex(person?.index)
   const roleBlock = jgCtx?.roleBlock ?? null
@@ -1471,10 +1478,7 @@ function openCostCenterPersonJustify(person, centerRow) {
       ? ((performanceScore - groupAvgPerformance) / groupAvgPerformance) * 100
       : null
 
-  const displayName =
-    person?.name && String(person.name).trim()
-      ? String(person.name).trim()
-      : `Dipendente #${key}`
+  const displayName = personLabel(person, `Dipendente #${key}`)
   const gapPct = centerRow.gapMean
   const jgCtx = findJobGradingContextByIndex(person?.index)
   const roleBlock = jgCtx?.roleBlock ?? null
@@ -1572,10 +1576,7 @@ function openPersonJustify(person, roleBlock, band, hayBand) {
       ? ((performanceScore - fascAvgPerformance) / fascAvgPerformance) * 100
       : null
 
-  const displayName =
-    person?.name && String(person.name).trim()
-      ? String(person.name).trim()
-      : `Dipendente #${key}`
+  const displayName = personLabel(person, `Dipendente #${key}`)
   const gapPct = hayBandAdjustedGapPct(hayBand)
 
   justifyingPerson.value = {
@@ -1817,8 +1818,8 @@ function openQuartileOutlierJustifyTab(row) {
   } else {
     justifyingPerson.value = {
       key,
-      displayName: row.name && String(row.name).trim() ? String(row.name).trim() : `Dipendente #${key}`,
-      label: `Outlier quartile · #${key}`,
+      displayName: personLabel(row, `Dipendente #${key}`),
+      label: `Outlier quartile · ${employeeCode(row)}`,
       seniority: fullRow?.seniority || null,
       seniorityYearsRaw: null,
       fascAvgSeniorityYears: null,
@@ -2424,7 +2425,7 @@ onMounted(async () => {
                     <table class="eu-outlier-table">
                       <thead>
                         <tr>
-                          <th>#</th>
+                          <th>ID</th>
                           <th>Nome</th>
                           <th>Genere</th>
                           <th>Ruolo</th>
@@ -2434,7 +2435,7 @@ onMounted(async () => {
                       </thead>
                       <tbody>
                         <tr v-for="p in quartilePeople(q.quartile)" :key="'qp-' + q.quartile + '-' + p.index">
-                          <td>{{ p.index }}</td>
+                          <td class="emp-id">{{ employeeCode(p) }}</td>
                           <td>{{ p.name || '—' }}</td>
                           <td><span :class="personGenderClass(p.gender)">{{ p.gender }}</span></td>
                           <td>{{ p.role || '—' }}</td>
@@ -2526,6 +2527,7 @@ onMounted(async () => {
                   <thead>
                     <tr>
                       <th>Q</th>
+                      <th>ID</th>
                       <th>Nome</th>
                       <th>Genere</th>
                       <th class="eu-outlier-num">{{ euMetricLabelShort }}</th>
@@ -2537,6 +2539,7 @@ onMounted(async () => {
                   <tbody>
                     <tr v-for="row in quartileOutlierRows" :key="'o-' + row.index">
                       <td>Q{{ row.quartile }}</td>
+                      <td class="emp-id">{{ employeeCode(row) }}</td>
                       <td>{{ row.name || '—' }}</td>
                       <td><span :class="personGenderClass(row.gender)">{{ row.gender }}</span></td>
                       <td class="eu-outlier-num">{{ formatNum(row.salary) }}</td>
@@ -2557,8 +2560,8 @@ onMounted(async () => {
                 <ul class="eu-outlier-excluded-list">
                   <li v-for="ex in quartileExcludedEntries" :key="'ex-' + ex.index" class="eu-outlier-excluded-item">
                     <div class="eu-outlier-ex-main">
+                      <span class="emp-id">{{ employeeCode(ex) }}</span>
                       <span class="eu-outlier-ex-name">{{ ex.name || '—' }}</span>
-                      <span class="muted">#{{ ex.index }}</span>
                     </div>
                     <p class="eu-outlier-ex-note">{{ ex.note }}</p>
                     <button type="button" class="btn-eu-outlier btn-eu-outlier-ghost" @click="clearQuartileOutlierExclusion(ex.index)">Ripristina in analisi</button>
@@ -2738,7 +2741,7 @@ onMounted(async () => {
                     >
                       <p v-if="row.insufficientSample" class="muted ccnl-sample-note">{{ row.sampleMsg }}</p>
                       <div class="people-header ccnl-person-header">
-                        <span>#</span>
+                        <span>ID</span>
                         <span>Persona</span>
                         <span>Genere</span>
                         <span>Ruolo</span>
@@ -2751,7 +2754,7 @@ onMounted(async () => {
                         :key="'ccnl-p-' + group.ccnlKey + '-' + row.levelKey + '-' + p.index"
                         class="people-row ccnl-person-row"
                       >
-                        <span>{{ p.index }}</span>
+                        <span class="emp-id">{{ employeeCode(p) }}</span>
                         <span>{{ p.name || '–' }}</span>
                         <span><span :class="personGenderClass(p.gender)">{{ p.gender }}</span></span>
                         <span>{{ p.role || '–' }}</span>
@@ -2806,6 +2809,7 @@ onMounted(async () => {
               </div>
               <div v-if="expandedTeaBands.has(row.band)" class="people-detail">
                 <div class="people-header tea-band-people">
+                  <span>ID</span>
                   <span>Dipendente</span>
                   <span>Sesso</span>
                   <span>Ruolo</span>
@@ -2815,6 +2819,7 @@ onMounted(async () => {
                   <span>RAL FTE</span>
                 </div>
                 <div v-for="person in row.people" :key="'bp-' + row.band + '-' + person.index" class="people-row tea-band-people">
+                  <span class="emp-id">{{ employeeCode(person) }}</span>
                   <span>{{ person.name || '–' }}</span>
                   <span>{{ person.gender || '–' }}</span>
                   <span>{{ person.role || '–' }}</span>
@@ -2935,14 +2940,14 @@ onMounted(async () => {
                     >
                       <div class="people-detail hay-person-detail jg-role-persons-after-table">
                       <div class="people-header hay-person-header">
-                        <span>#</span><span><svg class="inline-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13"><circle cx="12" cy="7" r="4"/><path d="M5.5 21a6.5 6.5 0 0113 0"/></svg> Persona</span><span class="hay-person-deviation-head" title="Scostamento % retribuzione totale rispetto alla media della fascia">Scost. vs media fascia</span><span>Retrib. base</span><span>Comp. variabile</span>                        <span>Retrib. totale</span><span>Giustificativo</span>
+                        <span>ID</span><span><svg class="inline-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13"><circle cx="12" cy="7" r="4"/><path d="M5.5 21a6.5 6.5 0 0113 0"/></svg> Persona</span><span class="hay-person-deviation-head" title="Scostamento % retribuzione totale rispetto alla media della fascia">Scost. vs media fascia</span><span>Retrib. base</span><span>Comp. variabile</span>                        <span>Retrib. totale</span><span>Giustificativo</span>
                       </div>
                       <div
                         v-for="p in rb.people"
                         :key="`${rb.level}-${sub.label}-${rb.role}-${p.index}`"
                         class="people-row hay-person-row"
                       >
-                        <span>{{ p.index }}</span>
+                        <span class="emp-id">{{ employeeCode(p) }}</span>
                         <span>
                           <svg
                             v-if="p.gender === 'M'"
@@ -3121,7 +3126,7 @@ onMounted(async () => {
                 <div v-if="isCostCenterExpanded(row.costCenterKey)" class="people-detail ccnl-level-detail cost-center-detail">
                   <p v-if="row.insufficientSample" class="muted ccnl-sample-note">{{ row.sampleMsg }}</p>
                   <div class="people-header ccnl-person-header cost-center-person-header">
-                    <span>#</span>
+                    <span>ID</span>
                     <span>Persona</span>
                     <span>Genere</span>
                     <span>Ruolo</span>
@@ -3135,7 +3140,7 @@ onMounted(async () => {
                     :key="'cdc-p-' + row.costCenterKey + '-' + p.index"
                     class="people-row ccnl-person-row cost-center-person-row"
                   >
-                    <span>{{ p.index }}</span>
+                    <span class="emp-id">{{ employeeCode(p) }}</span>
                     <span>{{ p.name || '–' }}</span>
                     <span><span :class="personGenderClass(p.gender)">{{ p.gender }}</span></span>
                     <span>{{ p.role || '–' }}</span>
@@ -3915,6 +3920,7 @@ onMounted(async () => {
               <table class="storico-table">
                 <thead>
                   <tr>
+                    <th>ID</th>
                     <th>Persona</th>
                     <th>Ruolo</th>
                     <th>Totale</th>
@@ -3925,6 +3931,7 @@ onMounted(async () => {
                 </thead>
                 <tbody>
                   <tr v-for="p in simResult.colleagueShifts" :key="p.index">
+                    <td class="emp-id">{{ employeeCode(p) }}</td>
                     <td>{{ p.name }}</td>
                     <td>{{ p.role }}</td>
                     <td>{{ formatEuro(p.totalSalary) }}</td>
@@ -5253,7 +5260,13 @@ onMounted(async () => {
 
 .people-header.tea-band-people,
 .people-row.tea-band-people {
-  grid-template-columns: 1.4fr 0.45fr 1.4fr 0.6fr 0.5fr 0.9fr 0.9fr;
+  grid-template-columns: 6.5rem 1.4fr 0.45fr 1.4fr 0.6fr 0.5fr 0.9fr 0.9fr;
+}
+.emp-id {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.78rem;
 }
 
 .job-row.ccnl-level-row {
@@ -5329,7 +5342,7 @@ onMounted(async () => {
 .people-header.ccnl-person-header,
 .people-row.ccnl-person-row {
   display: grid;
-  grid-template-columns: 2.5rem 1.2fr 3rem 1fr 1fr 1fr 7rem;
+  grid-template-columns: 6.75rem 1.2fr 3rem 1fr 1fr 1fr 7rem;
   gap: 0.5rem;
   align-items: center;
   font-size: 0.8125rem;
@@ -5399,7 +5412,7 @@ onMounted(async () => {
 }
 .people-header.cost-center-person-header,
 .people-row.cost-center-person-row {
-  grid-template-columns: 2.5rem 1.1fr 3rem 1fr 0.75fr 1fr 1fr 7rem;
+  grid-template-columns: 6.75rem 1.1fr 3rem 1fr 0.75fr 1fr 1fr 7rem;
 }
 .subtab--integrative {
   font-style: normal;
@@ -5806,7 +5819,7 @@ onMounted(async () => {
 
 .hay-person-header,
 .hay-person-row {
-  grid-template-columns: 0.4fr 1.5fr 0.9fr 1fr 1fr 1fr 1.15fr;
+  grid-template-columns: 6.75rem 1.5fr 0.9fr 1fr 1fr 1fr 1.15fr;
 }
 
 /* Blocco persone: sfondo bianco (stacca dal grigio/azzurro di .people-detail) */

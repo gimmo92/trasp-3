@@ -49,6 +49,7 @@ function drawLetter(doc, payload, letter, isFirst) {
   y += introLines.length * 5.5 + 8
 
   const rows = [
+    ['ID dipendente', letter.employeeId || '–'],
     ['Ruolo', letter.role || '–'],
     ['Manager', letter.managerName || '–'],
     ['Leva', letter.leverLabel],

@@ -146,6 +146,7 @@ export function peopleFromJobResults(jobResults) {
       seen.add(person.index)
       out.push({
         id: `emp-${person.index}`,
+        employeeId: person.employeeId != null && String(person.employeeId).trim() !== '' ? String(person.employeeId).trim() : '',
         name: person.name ? String(person.name).trim() : `Dipendente ${person.index}`,
         role: person.role ? String(person.role).trim() : 'Ruolo non indicato',
         level: person.level ? String(person.level).trim() : 'N/D',
@@ -578,6 +579,7 @@ export function letterRows({ cards, proposals, packages, settings, names }) {
       if (amount <= 0) continue
       rows.push({
         id: person.id,
+        employeeId: person.employeeId || '',
         name: person.name,
         role: person.role,
         level: person.level,
@@ -619,7 +621,7 @@ export function payrollCsv(rows, effectiveDate) {
   for (const row of rows) {
     lines.push(
       [
-        row.id,
+        row.employeeId || '',
         row.name,
         row.role,
         row.level,

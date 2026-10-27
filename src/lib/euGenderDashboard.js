@@ -65,6 +65,7 @@ export function assignSalaryQuartiles(normalized, metric, options = {}) {
     const qIndex = Math.min(3, Math.floor(idx / qSize))
     groups[qIndex].people.push({
       index: r.index,
+      employeeId: r.employeeId ?? null,
       name: r.name,
       gender: r.gender,
       role: r.role,
@@ -109,6 +110,7 @@ export function computeQuartileOutliers(normalized, metric, options = {}) {
       const sign = dev > 0 ? '+' : ''
       outliers.push({
         index: r.index,
+        employeeId: r.employeeId ?? null,
         name: r.name,
         gender: r.gender,
         salary: v,
