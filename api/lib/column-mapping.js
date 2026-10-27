@@ -136,6 +136,9 @@ const DISQUALIFY = {
   [R.fringeBenefits]: [/\bwelfare\b/i],
   [R.ccnl]: [/\blivello\b/i, /\bminimo\b/i, /\btabell/i, /\binquadramento\b/i],
   [R.level]: [/^ccnl$/i, /\bcontratto\s*collettivo\b/i, /\bistruzione\b/i],
+  [R.category]: [/\bqualifica\b/i, /\blivello\b/i, /^ccnl$/i, /\bdescrizione\s*ruolo\b/i],
+  [R.description]: [/\bcodice\s*mansione\b/i, /\bqualifica\b/i],
+  [R.employeeName]: [/^nome$/i, /^cognome$/i],
   [R.superminimo]: [/\bass\.?\s*le\b/i, /(?<!non\s)assorb/i],
   [R.overtime]: [/\bforfait\b/i],
   [R.performanceScore]: [/\bsoft\b/i, /\bhard\b/i],
@@ -168,8 +171,9 @@ const SCORE_PATTERNS = {
     { re: /\b(totale|total\s*comp|annual\s*total)\b/i, w: 5 },
   ],
   [R.category]: [
-    { re: /\b(categoria|inquadramento|classificazione)\b/i, w: 8 },
-    { re: /\bcentro\s*di\s*costo\b/i, w: 4 },
+    { re: /\bdescrizione\s*cdr\b/i, w: 12 },
+    { re: /\bcentro\s*di\s*costo\b/i, w: 8 },
+    { re: /\b(categoria|inquadramento|classificazione)\b/i, w: 4 },
   ],
   [R.role]: [
     { re: /\b(ruolo|job\s*title|posizione|mansione|title)\b/i, w: 8 },
@@ -587,8 +591,8 @@ REGOLE OBBLIGATORIE (Italia):
 - totalSalary = retribuzione TOTALE annua lorda (totale competenze, lordo annuo, RAL totale). MAI: INPS, contributi previdenziali, costo azienda, solo componenti variabili, 14ma/13ma.
 - variableComponents = totale componenti variabili aggregato (es. "TOT COMP VARIAB"), solo se non è una voce specifica. MAI: base fissa, INPS, bonus/MBO, premio di risultato, straordinari, indennità variabili, una tantum, fringe, welfare, scatti.
 - gender = sesso/genere (M/F).
-- employeeName = nome dipendente / nominativo.
-- category = categoria o inquadramento (centro di costo solo se è l'unica colonna organizzativa).
+- employeeName = nome e cognome in un'unica colonna. MAI la sola colonna Nome o la sola colonna Cognome: quelle sono firstName e lastName.
+- category = centro di costo o Descrizione CdR. MAI la qualifica (operaio/impiegato/quadro), che è qualification.
 - role = titolo ruolo/posizione (es. "Ruolo").
 - level = livello CCNL contrattuale.
 - description = descrizione mansione/job desc.

@@ -1082,6 +1082,11 @@ async function processLoadedWorkbook(rows, headers) {
     transparencyRoleOverrides.value = {}
     const heuristic = detectColumnRoles(headers, rows)
     let suggested = { ...heuristic }
+    if (isTeaTracciato(headers)) {
+      columnMapping.value = suggested
+      analisiStep.value = 'mapping'
+      return
+    }
     if (geminiEnabled.value) {
       geminiLoading.value = true
       try {

@@ -162,7 +162,8 @@ export const MAPPING_UI_SECTIONS = [
     id: 'necessari',
     title: 'Necessari (per analisi affidabile)',
     fields: [
-      { role: COLUMN_ROLES.employeeName, label: 'Nome dipendente', hint: 'Se il file separa Nome e Cognome, usa quei due campi nella sezione tracciato TEA' },
+      { role: COLUMN_ROLES.firstName, label: 'Nome' },
+      { role: COLUMN_ROLES.lastName, label: 'Cognome' },
       {
         role: COLUMN_ROLES.gender,
         label: 'Genere (M/F)',
@@ -283,9 +284,10 @@ export const MAPPING_UI_SECTIONS = [
     id: 'facoltativi',
     title: 'Facoltativi',
     fields: [
+      { role: COLUMN_ROLES.employeeName, label: 'Nome e cognome (colonna unica)', hint: 'Solo se il file non ha Nome e Cognome in due colonne' },
       { role: COLUMN_ROLES.role, label: 'Ruolo / job title' },
-      { role: COLUMN_ROLES.description, label: 'Descrizione ruolo' },
-      { role: COLUMN_ROLES.category, label: 'Descrizione CdR / centro di costo' },
+      { role: COLUMN_ROLES.description, label: 'Descrizione ruolo', hint: 'Nel tracciato TEA non c’è: la mansione è il codice mansione' },
+      { role: COLUMN_ROLES.category, label: 'Centro di costo', hint: 'Nel tracciato TEA è la Descrizione CdR, non la qualifica' },
       { role: COLUMN_ROLES.seniority, label: 'Anzianità' },
       { role: COLUMN_ROLES.roleSeniority, label: 'Anzianità nel ruolo' },
       { role: COLUMN_ROLES.performanceScore, label: 'Valutazione media complessiva (1–5)' },
@@ -296,8 +298,6 @@ export const MAPPING_UI_SECTIONS = [
     title: 'Tracciato TEA',
     fields: [
       { role: COLUMN_ROLES.employeeId, label: 'ID dipendente' },
-      { role: COLUMN_ROLES.firstName, label: 'Nome' },
-      { role: COLUMN_ROLES.lastName, label: 'Cognome' },
       { role: COLUMN_ROLES.company, label: 'Società' },
       { role: COLUMN_ROLES.qualification, label: 'Qualifica' },
       { role: COLUMN_ROLES.weeklyFullTimeHours, label: 'Orario settimanale full-time (ore)', hint: 'Serve a calcolare la retribuzione oraria dalla RAL' },
