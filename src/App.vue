@@ -12,13 +12,10 @@ import {
   missingRequiredMappingRoles,
   missingRecommendedMappingRoles,
 } from './lib/excel.js'
-import { mergeColumnMappings, isTeaTracciato } from './lib/column-mapping.js'
+import { isTeaTracciato } from './lib/column-mapping.js'
 import { teaPayComposition } from './lib/teaTracciato.js'
 import { computeIndicators, computeBandGenderGaps, computeAdjustedGap } from './lib/indicators.js'
-import {
-  suggestColumnMappingWithGemini,
-  computeIndicatorsWithGemini,
-} from './lib/gemini.js'
+import { computeIndicatorsWithGemini } from './lib/gemini.js'
 import {
   buildNormalizedJobGradingData,
   groupByLevel,
@@ -217,7 +214,7 @@ function saveRoleValuationModal() {
 /** Risultati analisi: dashboard UE genere (default) | job grading | giustificativo persona */
 const resultsTab = ref('eu_dashboard')
 /** Tab risultati da ripristinare dopo chiusura giustificativo persona */
-const resultsTabBeforeJustify = ref('job_grading')
+const resultsTabBeforeJustify = ref('eu_dashboard')
 /** Metrica retributiva per KPI dashboard (default: retribuzione base) */
 const euDashboardMetric = ref(SALARY_METRICS.base)
 
@@ -1080,35 +1077,14 @@ async function processLoadedWorkbook(rows, headers) {
     excelHeaders.value = headers
     quartileOutlierJustifications.value = {}
     transparencyRoleOverrides.value = {}
-    const heuristic = detectColumnRoles(headers, rows)
-    let suggested = { ...heuristic }
-    if (isTeaTracciato(headers)) {
-      columnMapping.value = suggested
-      analisiStep.value = 'mapping'
+    if (!isTeaTracciato(headers)) {
+      columnMapping.value = {}
+      uploadError.value = 'Il file non è il tracciato TEA. Questa analisi accetta solo quel tracciato.'
+      analisiStep.value = 'upload'
       return
     }
-    if (geminiEnabled.value) {
-      geminiLoading.value = true
-      try {
-        const aiMapping = await suggestColumnMappingWithGemini(headers, rows)
-        if (aiMapping && Object.keys(aiMapping).length > 0)
-          suggested = mergeColumnMappings(heuristic, aiMapping, headers)
-      } catch (geminiErr) {
-        geminiInfoNotice.value =
-          'Riconoscimento AI non disponibile (' +
-          (geminiErr.message || String(geminiErr)) +
-          '). È attivo il mapping automatico delle colonne: controllalo e correggilo se serve.'
-      } finally { geminiLoading.value = false }
-    } else {
-      if (geminiApiUnreachable.value) {
-        geminiInfoNotice.value =
-          'Claude non disponibile: in ambiente di sviluppo le route /api/gemini non sono servite da Vite. Usa il mapping euristico oppure avvia il progetto con `vercel dev` (con variabile ANTHROPIC_API_KEY) oppure configura la chiave sul deploy.'
-      } else {
-        geminiInfoNotice.value =
-          'Claude non attivo: imposta la variabile ANTHROPIC_API_KEY (console.anthropic.com) nel pannello Environment Variables del deploy (es. Vercel → Settings → Environment Variables). È attivo il mapping euristico delle colonne.'
-      }
-    }
-    columnMapping.value = suggested
+    columnMapping.value = detectColumnRoles(headers, rows)
+    uploadError.value = ''
     analisiStep.value = 'mapping'
 }
 
@@ -1191,7 +1167,7 @@ async function confirmMapping() {
     runJobGrading()
 
     if (!indicatorsResult.value && jobResults.value.length === 0) {
-      uploadError.value = 'Nessun dato valido. Verifica il mapping delle colonne per il job grading.'
+      uploadError.value = 'Nessun dato valido. Verifica il mapping del tracciato TEA.'
       return
     }
 
@@ -1677,7 +1653,7 @@ function savePersonJustify() {
       personJustifications.value[key] = text
     }
   }
-  const back = resultsTabBeforeJustify.value || 'job_grading'
+  const back = resultsTabBeforeJustify.value || 'eu_dashboard'
   justifyingPerson.value = null
   justifyText.value = ''
   if (personJustifyFileInput.value) personJustifyFileInput.value.value = ''
@@ -1685,7 +1661,7 @@ function savePersonJustify() {
 }
 
 function cancelPersonJustify() {
-  const back = resultsTabBeforeJustify.value || 'job_grading'
+  const back = resultsTabBeforeJustify.value || 'eu_dashboard'
   justifyingPerson.value = null
   justifyText.value = ''
   if (personJustifyFileInput.value) personJustifyFileInput.value.value = ''
@@ -2103,7 +2079,7 @@ onMounted(async () => {
       <!-- Step 1: Link Excel -->
       <div v-if="analisiStep === 'upload'" class="analisi-content panel-card">
         <h2 class="analisi-title">Collegamento al file Excel</h2>
-        <p class="analisi-desc">Incolla il link a un file Excel (.xlsx) in cloud oppure carica un file locale (.xlsx, .xls, .csv). L'app mapperà automaticamente le colonne per la valutazione dei lavori di pari valore (job grading).</p>
+        <p class="analisi-desc">Carica il tracciato TEA (.xlsx o .csv). Le colonne vengono riconosciute da sole: nome e cognome restano separati, le voci fisse sono mensili e la RAL è annua.</p>
         <div class="url-input-wrap">
           <input v-model="excelUrl" type="url" class="url-input" placeholder="https://... file.xlsx" :disabled="uploadLoading || geminiLoading" @keydown.enter="onLoadFromUrl" />
           <button type="button" class="btn-primary" :disabled="uploadLoading || geminiLoading || !excelUrl.trim()" @click="onLoadFromUrl">
@@ -2141,8 +2117,8 @@ onMounted(async () => {
       <div v-else-if="analisiStep === 'mapping'" class="analisi-content">
         <h2 class="analisi-title">Verifica assegnazione colonne</h2>
         <p class="analisi-desc">
-          Associa ogni dato alla colonna corrispondente del file. I campi <strong>obbligatori</strong> sono necessari per avviare l'analisi;
-          quelli consigliati migliorano l'affidabilità del gap retributivo.
+          Controlla che ogni campo del tracciato TEA punti alla colonna giusta. Nome e cognome sono due colonne.
+          Le voci segnate come mensili non entrano nella RAL.
         </p>
         <p v-if="teaTracciatoActive" class="mapping-warn">
           Tracciato TEA riconosciuto. Minimo, superminimi, scatti, forfait straordinari e altre voci fisse sono mensili: restano nel dettaglio e non si sommano alla RAL.
@@ -2208,11 +2184,6 @@ onMounted(async () => {
           </label>
         </div>
 
-        <div class="settings-panel">
-          <h3 class="settings-title">Metodo di analisi</h3>
-          <p class="settings-hint">Il job grading pesa tutti i ruoli insieme. Le fasce raccolgono i lavori con lo stesso punteggio, da qualunque livello CCNL. Il confronto per livello resta nel tab dedicato.</p>
-        </div>
-
         <p v-if="geminiInfoNotice" class="upload-info">{{ geminiInfoNotice }}</p>
         <p v-if="uploadError" class="upload-error">{{ uploadError }}</p>
         <div class="mapping-actions">
@@ -2269,15 +2240,6 @@ onMounted(async () => {
             @click="resultsTab = 'ccnl_level'"
           >
             Confronto per livello CCNL
-          </button>
-          <button
-            type="button"
-            class="subtab subtab--integrative"
-            :class="{ active: resultsTab === 'job_grading' }"
-            :disabled="jobResults.length === 0"
-            @click="resultsTab = 'job_grading'"
-          >
-            Analisi per fascia (integrativa)
           </button>
           <button
             type="button"
