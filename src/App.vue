@@ -14,6 +14,7 @@ import {
 } from './lib/excel.js'
 import { isTeaTracciato } from './lib/column-mapping.js'
 import { teaPayComposition } from './lib/teaTracciato.js'
+import { groupByTeaBand } from './lib/teaBands.js'
 import { computeIndicators, computeBandGenderGaps, computeAdjustedGap } from './lib/indicators.js'
 import { computeIndicatorsWithGemini } from './lib/gemini.js'
 import {
@@ -1724,6 +1725,15 @@ const genderNormalizedForAnalysis = computed(() =>
     (r) => !isQuartileAnalysisExcluded(r.index) && !isPersonJustified(r),
   ),
 )
+const teaBandRows = computed(() => groupByTeaBand(genderNormalizedForAnalysis.value))
+const expandedTeaBands = ref(new Set())
+
+function toggleTeaBand(band) {
+  const next = new Set(expandedTeaBands.value)
+  if (next.has(band)) next.delete(band)
+  else next.add(band)
+  expandedTeaBands.value = next
+}
 
 const bandGenderGaps = computed(() =>
   computeBandGenderGaps(genderNormalizedForAnalysis.value, jobResults.value),
@@ -2243,6 +2253,15 @@ onMounted(async () => {
           </button>
           <button
             type="button"
+            class="subtab"
+            :class="{ active: resultsTab === 'tea_band' }"
+            :disabled="teaBandRows.length === 0"
+            @click="resultsTab = 'tea_band'"
+          >
+            Analisi per fascia
+          </button>
+          <button
+            type="button"
             class="subtab subtab--integrative"
             :class="{ active: resultsTab === 'cost_center' }"
             :disabled="!hasCostCenterData"
@@ -2758,6 +2777,56 @@ onMounted(async () => {
             </div>
           </template>
           <p v-else class="no-data-msg">Nessun livello CCNL disponibile. Verifica il mapping del file.</p>
+        </div>
+
+        <div v-show="resultsTab === 'tea_band'" class="band-section">
+          <h3 class="band-title">Fasce del tracciato</h3>
+          <p class="muted band-summary">Banda e Grade sono i numeri del file. La RAL media è quella annua, normalizzata solo sulla percentuale di part-time.</p>
+          <div v-if="teaBandRows.length" class="job-table">
+            <div class="job-row header hay-row tea-band-row">
+              <span>Banda</span>
+              <span>Grade nel file</span>
+              <span>N</span>
+              <span>N uomini</span>
+              <span>N donne</span>
+              <span>RAL media M</span>
+              <span>RAL media F</span>
+              <span>Gap</span>
+            </div>
+            <template v-for="row in teaBandRows" :key="'banda-' + row.band">
+              <div class="job-row hay-row tea-band-row clickable" @click="toggleTeaBand(row.band)">
+                <span><strong>{{ expandedTeaBands.has(row.band) ? '▾' : '▸' }} {{ row.band }}</strong></span>
+                <span>{{ row.gradeLabel }}</span>
+                <span>{{ row.n }}</span>
+                <span>{{ row.nMen }}</span>
+                <span>{{ row.nWomen }}</span>
+                <span>{{ formatNum(row.avgMen) }}</span>
+                <span>{{ formatNum(row.avgWomen) }}</span>
+                <span>{{ formatGapMforF(row.gapPct) }}</span>
+              </div>
+              <div v-if="expandedTeaBands.has(row.band)" class="people-detail">
+                <div class="people-header tea-band-people">
+                  <span>Dipendente</span>
+                  <span>Sesso</span>
+                  <span>Ruolo</span>
+                  <span>Livello</span>
+                  <span>Grade</span>
+                  <span>RAL annua</span>
+                  <span>RAL FTE</span>
+                </div>
+                <div v-for="person in row.people" :key="'bp-' + row.band + '-' + person.index" class="people-row tea-band-people">
+                  <span>{{ person.name || '–' }}</span>
+                  <span>{{ person.gender || '–' }}</span>
+                  <span>{{ person.role || '–' }}</span>
+                  <span>{{ person.level || '–' }}</span>
+                  <span>{{ person.grade || '–' }}</span>
+                  <span>{{ formatNum(person.baseSalary) }}</span>
+                  <span>{{ formatNum(person.baseSalaryFte) }}</span>
+                </div>
+              </div>
+            </template>
+          </div>
+          <p v-else class="no-data-msg">Nessuna banda nel tracciato. Verifica la colonna Banda.</p>
         </div>
 
         <div v-show="resultsTab === 'job_grading'">
@@ -5176,6 +5245,15 @@ onMounted(async () => {
 
 .job-row.hay-row {
   grid-template-columns: 1fr 1.35fr 0.72fr 0.72fr 0.65fr 1fr 1fr;
+}
+
+.job-row.tea-band-row {
+  grid-template-columns: 0.7fr 1.4fr 0.45fr 0.7fr 0.7fr 1fr 1fr 0.8fr;
+}
+
+.people-header.tea-band-people,
+.people-row.tea-band-people {
+  grid-template-columns: 1.4fr 0.45fr 1.4fr 0.6fr 0.5fr 0.9fr 0.9fr;
 }
 
 .job-row.ccnl-level-row {
